@@ -1,0 +1,226 @@
+---
+title: "Prepare data for simulations"
+output: html_document
+date: "2026-06-24"
+author: Cassandra Stamsaas & Lars Snipen
+---
+
+# Set up
+
+## Required Packages
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(microseq)
+library(data.table)
+```
+
+## Global Settings
+
+```{r}
+setwd("/path/to/working/directory") # Path to your working directory
+seed <- 123                         # Set the seed-value for the script
+```
+
+# Reference Data Preparation
+
+## Filtering High-Quality Genomes
+
+```{r}
+load("/path/to/GTDB_table/gtdb.tbl.RData")                                  # Path to your GTDB table
+
+gtdb_genomes_16S.tbl <- gtdb_16S.tbl %>% 
+  filter(ncbi_assembly_level %in% c("Complete Genome", "Chromosome")) %>%   # Only keep assembly level "Complete Genome" and "Chromosome"
+  mutate(n_16S = n(), .by = accession) %>%                                  # Count number of sequence variants per unique accession number
+  mutate(length = str_length(Sequence)) %>%                                 # Create a column for sequence length
+  select(Header, accession, length, n_16S, gc_percentage, genome_size,
+         domain, phylum, class, order, family, genus, species,
+         Sequence)                                                          # Select necessary columns
+```
+
+## In Silico Amplicon Extraction (Primer Matching)
+
+```{r}
+FWD <- "CCTACGGGRBGCASCAG"                                                      # Define forward primer
+REV <- "GGACTACYVGGGTATCTAAT"                                                   # Define reverse primer
+pattern <- str_c(iupac2regex(FWD),
+                 ".+",
+                 iupac2regex(reverseComplement(REV)))                           # Construct a regular expression to match the sequence spanning from the forward to the reverse primer
+
+gtdb_genomes_16S_amplicon.tbl <- gtdb_genomes_16S.tbl %>% 
+  mutate(amplicon = str_extract(Sequence, pattern)) %>%                         # Extract the sequence matching the primer pattern into a new column
+  mutate(amplicon = str_sub(amplicon, start = str_length(FWD)+1, end = -1)) %>% # Truncate the forward primer from the 5' end of the amplicon
+  mutate(amplicon = str_sub(amplicon, start = 1, end = -str_length(REV))) %>%   # Truncate the reverse primer from the 3' end of the amplicon
+  filter(!is.na(amplicon)) %>%                                                  # Discard all observations where the target amplicon was not detected
+  filter(!str_detect(amplicon, regex("[^ACGT]", ignore_case = TRUE)))           # Exclude sequences containing ambiguous bases; retain only strict A, C, G, T nucleotides
+```
+
+# Simulation Design and Community Assembly
+
+## Species and Strain Sampling
+
+```{r}
+set.seed(seed)                                                                  # Ensure reproducibility                                        
+n_communities <- 20                                                             # Set the number of replicate datasets
+n_species <- 1000                                                               # Set the number of species for each dataset
+community.tbl <- NULL                                                           
+
+for(i in 1:n_communities){
+  selected_species <- sample(x = unique(gtdb_genomes_16S_amplicon.tbl$species), # Select n_species unique species
+                             size = n_species)                                  
+  
+  filtered_tbl <- gtdb_genomes_16S_amplicon.tbl %>%                             # Filter the table to only contain the selected species
+    filter(species %in% selected_species)                                       
+  
+  chosen_accessions <- filtered_tbl %>%                                         # Take up to k=3 genomes; fewer if species has less
+    group_by(species) %>%
+    summarise(
+      k = 3,
+      accession = list({
+        acc <- unique(accession)
+        sample(acc, size = min(k, length(acc)))                               
+      }),
+      .groups = "drop"
+    ) %>%
+    unnest(accession) %>% 
+    select(-k)
+  
+  filtered_tbl <- filtered_tbl %>%                                              # Modify the table to contain all 16S variants for each genome
+    inner_join(chosen_accessions, by = c("species", "accession"))
+  
+  community.tbl <- filtered_tbl %>%                                             # Create the community table
+    mutate(community_id = i) %>% 
+    bind_rows(community.tbl)
+}
+```
+
+## Abundance Distribution Model
+
+```{r}
+# Function for exponential distribution
+# Returns a numeric vector of length n.genomes with exponentially decaying
+# relative abundances summing to 1, where the ratio between the most and
+# least abundant genome equals dynamic.range
+
+abundanceDistribution <- function(n.genomes = 1,
+                                  dynamic.range = 100){
+  if(n.genomes == 1){
+    return(1)
+  } else {
+    b <- log(dynamic.range)/(n.genomes - 1)
+    a <- 1 / (sum(exp(-b*(1:n.genomes - 1))))
+    abd <- a * exp(-b*(0:(n.genomes - 1)))
+    return(abd)
+  }
+}
+```
+
+## Assigning Abundances to Communities
+
+```{r}
+set.seed(seed)                                                  # Ensure reproducibility
+group_ids <- c("A")                                             # Currently one group; extend here to add experimental conditions
+community_ids <- unique(community.tbl$community_id)
+community_abundance.tbl <- NULL
+dyn.range <- 10                                                 # Set the dynamic range for the abundance distribution
+
+for(i in 1:length(community_ids)){                              # Iterate over each replicate dataset
+  
+  c.tbl <- community.tbl %>%                                    # Extract unique species present in the current community
+    filter(community.tbl$community_id == community_ids[i]) %>% 
+    distinct(species, community_id)
+  
+  n.species <- nrow(c.tbl)
+  
+  abd <- abundanceDistribution(n.species, dyn.range)            # Generate a theoretical abundance distribution for the community
+  
+  for(j in 1:length(group_ids)){                                # Randomize abundance assignments for each group and append to the master table
+    community_abundance.tbl <- c.tbl %>% 
+      mutate(group_id = group_ids[j]) %>% 
+      mutate(species_abundance = abd[sample(n.species)]) %>% 
+      bind_rows(community_abundance.tbl)
+  }
+}
+
+community.tbl <- left_join(community.tbl,                       # Merge the assigned abundances back into the main dataset
+                           community_abundance.tbl, 
+                           by = c("species", "community_id"))
+```
+
+## Normalizing Amplicon-Level Abundances
+
+```{r}
+read_abundance.tbl <- community.tbl %>% 
+  select(-group_id) %>% 
+  group_by(species, community_id) %>%                                 # Group by species within each community to isolate species-specific metrics
+  mutate(n_strains_species = n_distinct(accession),                   # Count the number of unique strains (accessions) belonging to each species
+         n_amplicon_species = n(),                                    # Count the total number of amplicons (16S rRNA copies) across all strains of this species
+         amplicon_abundance = species_abundance / n_amplicon_species  # Distribute the assigned species abundance uniformly among all its individual amplicons
+  ) %>% 
+  ungroup() %>% 
+  group_by(community_id) %>%                                          # Group by community to perform normalization calculations per individual sample
+  mutate(total_abundance = sum(amplicon_abundance)) %>%               # Calculate the sum of all distributed amplicon abundances within each community
+  ungroup() %>% 
+  mutate(read_abundance = amplicon_abundance/total_abundance) %>%     # Divide each amplicon's abundance by the community total to obtain the final relative read abundance (sums to 1.0)
+  select(community_id, accession, read_abundance, domain, 
+         phylum, class, order, family, genus, species, 
+         Header, Sequence = amplicon)
+```
+
+# Data Export for readMachine Simulation
+
+## Generation of Reference FASTA Files
+
+```{r}
+community_ids <- unique(read_abundance.tbl$community_id)
+metadata.tbl <- NULL
+
+for(i in 1:length(community_ids)){                                            # Iterate through each unique community ID to process and export the data
+  m.tbl <- data.frame(community_id = community_ids[i],                        # Create a data frame mapping the current community ID to its FASTA filename
+                      amplicon_file = str_c("sample_",
+                                            community_ids[i],
+                                            ".fasta"))
+  r.tbl <- read_abundance.tbl %>%                                             # Process the read abundance data specifically for the current community
+    mutate(original_header = str_remove(Header, "-#.*$")) %>%                 # Strip any trailing modifiers or suffixes from the original sequence header
+    filter(read_abundance > 0) %>%                                            # Exclude amplicons with zero abundance to omit unsequenced variants
+    filter(community_id == community_ids[i]) %>%                              # Subset the data to isolate only the current community being processed
+    mutate(species = str_replace_all(species, " ", "_")) %>%                  # Replace spaces with underscores in species names
+    mutate(Header = str_c(community_ids[i], "_",                              # Construct a structured, comprehensive FASTA header containing lineage and abundance data
+                          "amplicon", 1:n(), "_",
+                          original_header, 
+                          ";tax=d:", domain, ",",
+                          "p:", phylum, ",",
+                          "c:", class, ",",
+                          "o:", order, ",",
+                          "f:", family, ",",
+                          "g:", genus, ",",
+                          "s:", species,
+                          " read_abundance=", 
+                          format(read_abundance, scientific = F)))
+  
+  writeFasta(r.tbl, out.file = 
+               file.path("amplicon_fasta", 
+                         paste0(n_species, "_species_", 
+                                dyn.range, "_dynamic"), m.tbl$amplicon_file)) # Write the processed community sequences to a FASTA file
+  
+  metadata.tbl <- bind_rows(metadata.tbl, m.tbl)                              # Append the current community's metadata row to the master metadata table
+}
+```
+
+## Generation of Simulation Metadata
+
+```{r}
+readpairs <- 100000                                         # Set the number of read pairs to simulate per sample
+metadata.file <- "metadata.tsv"                             # Set the output file name
+
+metadata.tbl <- metadata.tbl %>% 
+  mutate(sample_id = str_c("sample_", community_id)) %>%    # Create a unique sample identifier by prefixing the community ID
+  mutate(R1_file = str_c(sample_id, "_R1.fastq.gz")) %>%    # Construct the filename for the compressed forward reads (R1) FASTQ file
+  mutate(R2_file = str_c(sample_id, "_R2.fastq.gz")) %>%    # Construct the filename for the compressed reverse reads (R2) FASTQ file
+  mutate(readpairs = readpairs) %>%                         # Append the predefined number of read pairs as a constant column across all samples
+  relocate(sample_id)                                       # Position the sample_id column at the beginning of the data frame
+
+write.table(metadata.tbl, sep = "\t", 
+            row.names = F, quote = F, file = metadata.file) # Export the final metadata table as a tab-separated values (TSV) file
+```
+
