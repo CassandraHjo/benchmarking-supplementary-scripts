@@ -1,0 +1,322 @@
+---
+title: "Swarm Results Post-processing"
+author: "Cassandra Stamsaas"
+date: "2026-06-24"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Required Packages
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(microseq)
+library(Rsearch)
+```
+
+## Global Settings
+
+```{r}
+setwd("/path/to/working/directory") # Path to your working directory
+```
+
+## Prepare Directories and Paths
+
+```{r}
+path                <- "10000_species_10_dynamic"         # Define the dataset to process
+fastq.folder        <- file.path(path, "fastq")           # Directory containing the raw FASTQ files
+fastq_filt.folder   <- file.path(path, "fastq_filtered")  # Directory containing quality-filtered FASTQ files
+fasta_merged.folder <- file.path(path, "fasta_merged")    # Directory containing merged FASTA files
+rsearch_dir         <- file.path(path, "rsearch_results") # Directory containing Rsearch output
+fasta.folder        <- file.path(rsearch_dir, "fasta")    # Directory containing dereplicated FASTA files
+metadata.file       <- file.path(path, "metadata.tsv")    # Path to the metadata file
+
+swarm_results_folder <- file.path(path, "swarm_results") # Directory containing Swarm clustering output
+```
+
+## Metadata
+
+```{r}
+load(file.path(rsearch_dir, "metadata.tbl.RData"))  # Load the metadata table produced by the Rsearch pipeline
+```
+
+# Swarm Results Processing
+
+```{r}
+for (i in 1:nrow(metadata.tbl)) {                                                 # Iterate over each sample in the metadata table
+  
+  message(paste0("Processing sample ", 
+                 metadata.tbl$sample_id[i], 
+                 " (", i, "/", nrow(metadata.tbl), ")"))
+  
+  # ---------------------------
+  # Load and parse input data
+  # ---------------------------
+  
+  all.tbl <- readFasta(file.path(fasta.folder, 
+                                 metadata.tbl$dereplicated_fasta[i])) %>%         # Read the dereplicated FASTA file for the current sample
+    mutate(actual_cluster = Header,
+           actual_cluster = str_match(actual_cluster,
+                                      "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>%  # Extract the taxonomic label from the FASTA header as the ground truth cluster identity
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+") %>%                      # Parse the dereplicated sequence size (read count) from the FASTA header
+             as.numeric()
+    )
+  
+  metadata.tbl$n_species_pre_clustering[i] <- 
+    length(unique(all.tbl$actual_cluster))                                        # Record the number of distinct species present after dereplication
+  
+  # Read swarm output file
+  swarm.tbl <- read_tsv(
+    file.path(path, "swarm_results", 
+              paste0(metadata.tbl$sample_id[i], "_dereplicated_swarm.uc")),
+    col_names = c("record_type", "cluster_number", 
+                  "length_size", "percent_similarity", 
+                  "match_orientation", "X6", "X7", 
+                  "X8", "X9", "X10"))                                             # Read the SWARM UC-format output file for the current sample
+  
+  c.tbl <- swarm.tbl %>% 
+    rename(Header = X9,
+           centroid = X10) %>%                                                    # Rename positional UC columns to meaningful names
+    select(-c("length_size", "match_orientation", "X6", "X7", 
+              "X8")) %>%                                                          # Drop columns not needed for downstream analysis
+    filter(record_type != "C") %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>%                     # Remove cluster summary rows; retain only seed (S) and hit (H) records
+    mutate(size = as.numeric(size)) %>%                                           # Parse the sequence size from the header
+    mutate(cluster_number = as.character(cluster_number)) %>% 
+    mutate(centroid = ifelse(centroid == "*", Header, centroid))                  # Replace the placeholder "*" with the sequence's own header for centroid records
+  
+  # ---------------------------
+  # Filter singleton clusters
+  # ---------------------------
+  
+  c_modified.tbl <- c.tbl %>%
+    group_by(cluster_number) %>%
+    filter(!(n() == 1 & record_type == "S" & size == 1)) %>%
+    ungroup()                                                                     # Remove clusters consisting of a single centroid sequence with only one read
+  
+  metadata.tbl$n_clusters[i] <- length(unique(c_modified.tbl$cluster_number))     # Record the number of clusters remaining after singleton removal
+  
+  res.tbl <- c_modified.tbl %>%
+    arrange(cluster_number) %>% 
+    mutate(predicted_cluster = centroid,
+           predicted_cluster = str_match(
+             predicted_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>%        # Extract the taxonomic label of the cluster centroid as the predicted cluster identity
+    mutate(actual_cluster = Header,
+           actual_cluster = str_match(
+             actual_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>%           # Extract the taxonomic label of each member sequence as the ground truth identity
+    left_join(all.tbl %>% select(Header, Sequence), by = "Header")                # Attach the nucleotide sequence for each cluster member
+  
+  # ---------------
+  # Purity analysis
+  # ---------------
+  
+  # Prepare the data
+  clustering_results.tbl <- res.tbl                                               # Alias for readability in the purity analysis section
+  
+  cluster_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number) %>%
+    summarise(
+      total_reads = sum(size),
+      distinct_actual_clusters = 
+        n_distinct(actual_cluster),                                               # Count the number of distinct ground truth species within each predicted cluster
+      .groups = "drop"
+    ) %>%
+    mutate(status = ifelse(           
+      distinct_actual_clusters == 1,
+      "Pure",
+      "Mixed")
+    ) %>%                                                                         # Classify each cluster as pure (single species) or mixed (multiple species)
+    arrange(status, desc(total_reads))                                            # Sort so mixed clusters appear first, then by descending read count
+  
+  
+  metadata.tbl$n_pure_clusters[i] <- sum(cluster_summary$status == "Pure")        # Record the number of pure clusters for this sample
+  
+  purity_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(size_per_group = sum(size), .groups = "drop_last") %>%              # Sum read counts for each species within each predicted cluster
+    arrange(desc(size_per_group)) %>%
+    summarise(
+      total_cluster_size = sum(size_per_group),                                   # Total number of reads assigned to this predicted cluster
+      dominant_actual = first(actual_cluster),                                    # The species contributing the most reads to this cluster
+      dominant_size = first(size_per_group),                                      # Read count of the dominant species in this cluster
+      purity_pct = dominant_size / total_cluster_size                             # Cluster purity: proportion of reads belonging to the dominant species
+    ) %>%
+    arrange(purity_pct)
+  
+  total_reads <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>% 
+    select(size) %>% 
+    sum()                                                                         # Calculate the total number of reads across all clusters for normalization
+  
+  metadata.tbl$average_purity_score[i] <- mean(purity_summary$purity_pct)         # Average per-cluster purity across all clusters in this sample
+  
+  # -------------------------
+  # Perfect clusters analysis
+  #--------------------------
+  
+  input_totals <- all.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(total_size_in = sum(size, na.rm = TRUE), .groups = "drop")          # Calculate the total read count per species in the input before clustering
+  
+  cluster_summary <- clustering_results.tbl %>%
+    group_by(cluster_number) %>%
+    summarise(
+      n_species_in_cluster = n_distinct(actual_cluster),                          # Count the number of distinct species present in each cluster
+      cluster_species = first(actual_cluster),                                    # Record the species name (meaningful only for single-species clusters)
+      total_size_out = sum(size, na.rm = TRUE),                                   # Total number of reads in each cluster after clustering
+      .groups = "drop"
+    )
+  
+  species_distribution <- clustering_results.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(n_groups_for_species = n_distinct(cluster_number, na.rm = FALSE),   # Count how many predicted clusters each species is distributed across
+              .groups = "drop")
+  
+  perfect_clusters <- cluster_summary %>%
+    filter(!is.na(cluster_number)) %>%
+    filter(n_species_in_cluster == 1) %>%                                         # Retain only single-species clusters
+    left_join(species_distribution, 
+              by = c("cluster_species" = "actual_cluster")) %>%
+    filter(n_groups_for_species == 1) %>%                                         # Retain only species that appear in exactly one cluster
+    left_join(input_totals, by = c("cluster_species" = "actual_cluster")) %>%
+    filter(total_size_out == total_size_in)                                       # Retain only clusters where all reads for the species are recovered (no read loss)
+  
+  metadata.tbl$n_perfect_clusters[i] <- nrow(perfect_clusters)                    # Record the number of perfect clusters: pure, non-split, and complete
+  
+  
+  # ------------------------------------------
+  # Represented species and abundance profiles
+  #-------------------------------------------
+  
+  dominant_species_per_cluster <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(total_size = sum(size), .groups = "drop_last") %>%
+    arrange(cluster_number, desc(total_size)) %>%
+    summarise(dominant_actual_cluster = first(actual_cluster), 
+              .groups = "drop")                                                   # Assign each predicted cluster to the species contributing the most reads
+  
+  metadata.tbl$n_species_represented[i] <- 
+    length(unique(dominant_species_per_cluster$dominant_actual_cluster))          # Record the number of distinct species represented by at least one cluster
+  
+  n_species_with_multiple_clusters <- dominant_species_per_cluster %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(n_clusters = n(), .groups = "drop") %>%
+    filter(n_clusters >= 2) %>%
+    nrow()                                                                        # Count species that dominate more than one predicted cluster (over-splitting)
+  
+  metadata.tbl$n_species_with_multiple_clusters[i] <- 
+    n_species_with_multiple_clusters                                              # Record the number of over-split species for this sample
+  
+  fq <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) %>%
+    mutate(actual_cluster = Header,
+           actual_cluster = str_match(
+             actual_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2])                 # Read the R1 FASTQ file and extract the ground truth species label from each read header
+  
+  abundance_per_initiate_species <- fq %>%
+    group_by(actual_cluster) %>%
+    summarise(gold_standard_n = n(), .groups = "drop") %>%
+    mutate(gold_standard_rel_abundance = 
+             gold_standard_n / sum(gold_standard_n)) %>%
+    arrange(desc(gold_standard_rel_abundance))                                    # Calculate the ground truth relative abundance of each species from raw read counts
+  
+  abundance_per_species <- clustering_results.tbl %>%
+    left_join(dominant_species_per_cluster, by = "cluster_number") %>% 
+    mutate(dominant_actual_cluster = 
+             replace_na(dominant_actual_cluster, "Unassigned")) %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(n = sum(size), .groups = "drop") %>%
+    mutate(rel_abundance = n / sum(n)) %>%
+    arrange(desc(rel_abundance)) %>%
+    rename(actual_cluster = dominant_actual_cluster)                              # Calculate the observed relative abundance of each species from clustering results
+  
+  abundance.tbl <- abundance_per_initiate_species %>%
+    left_join(abundance_per_species, by = "actual_cluster") %>%
+    mutate(n = replace_na(n, 0),
+           rel_abundance = replace_na(rel_abundance, 0))                          # Combine ground truth and observed abundance tables; fill missing species with zero abundance
+  
+  metadata.tbl$abundance_correlation[i] <- cor(
+    abundance.tbl$gold_standard_rel_abundance, 
+    abundance.tbl$rel_abundance)                                                  # Calculate Pearson correlation between ground truth and observed relative abundances
+  
+  # ------------------------------------------
+  # Non-clustered sequence statistics
+  # ------------------------------------------
+  
+  nc.tbl <- c.tbl %>%
+    group_by(cluster_number) %>%
+    filter((n() == 1 & record_type == "S" & size == 1)) %>%                       # Isolate singleton clusters that were removed earlier (single seed with one read)
+    ungroup() %>% 
+    mutate(taxonomy = str_match(Header, 
+                                "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) %>%          # Extract the ground truth species label for each non-clustered sequence
+    left_join(abundance_per_initiate_species, 
+              by = c("taxonomy" = "actual_cluster"))                              # Attach ground truth abundance information for each non-clustered species
+  
+  metadata.tbl$n_reads_not_clustered[i] <- sum(nc.tbl$size)                       # Record the total number of reads that were not assigned to any cluster
+  metadata.tbl$n_species_not_clustered[i] <- n_distinct(nc.tbl$taxonomy)          # Record the number of distinct species represented only by non-clustered sequences
+  metadata.tbl$median_ground_truth_abundance[i] <- 
+    median(nc.tbl$gold_standard_rel_abundance)                                    # Record the median ground truth abundance of species that failed to cluster
+}
+
+save(metadata.tbl, file = file.path(swarm_results_folder, "metadata.tbl.RData"))  # Save the updated metadata table with all collected statistics
+```
+
+## Plotting preperations
+
+```{r}
+# Load per-dataset metadata tables
+load("path/to/some/directory/100_species_10_dynamic/swarm_results/metadata.tbl.RData")
+metadata_100s_10d.tbl <- metadata.tbl    # 100 species, dynamic range 10
+
+load("path/to/some/directory/100_species_100_dynamic/swarm_results/metadata.tbl.RData")
+metadata_100s_100d.tbl <- metadata.tbl   # 100 species, dynamic range 100
+
+load("path/to/some/directory/500_species_10_dynamic/swarm_results/metadata.tbl.RData")
+metadata_500s_10d.tbl <- metadata.tbl    # 500 species, dynamic range 10
+
+load("path/to/some/directory/500_species_100_dynamic/swarm_results/metadata.tbl.RData")
+metadata_500s_100d.tbl <- metadata.tbl   # 500 species, dynamic range 100
+
+load("path/to/some/directory/1000_species_10_dynamic/swarm_results/metadata.tbl.RData")
+metadata_1000s_10d.tbl <- metadata.tbl   # 1000 species, dynamic range 10
+
+load("path/to/some/directory/1000_species_100_dynamic/swarm_results/metadata.tbl.RData")
+metadata_1000s_100d.tbl <- metadata.tbl  # 1000 species, dynamic range 100
+
+load("path/to/some/directory/10000_species_10_dynamic/swarm_results/metadata.tbl.RData")
+metadata_10000s_10d.tbl <- metadata.tbl  # 10000 species, dynamic range 10
+
+load("path/to/some/directory/10000_species_100_dynamic/swarm_results/metadata.tbl.RData")
+metadata_10000s_100d.tbl <- metadata.tbl # 10000 species, dynamic range 100
+
+# Combine metadata tables by species richness
+metadata_100s   <- bind_rows(metadata_100s_10d.tbl,   metadata_100s_100d.tbl)    # All 100-species datasets
+metadata_500s   <- bind_rows(metadata_500s_10d.tbl,   metadata_500s_100d.tbl)    # All 500-species datasets
+metadata_1000s  <- bind_rows(metadata_1000s_10d.tbl,  metadata_1000s_100d.tbl)   # All 1000-species datasets
+metadata_10000s <- bind_rows(metadata_10000s_10d.tbl, metadata_10000s_100d.tbl)  # All 10000-species datasets
+
+# Combine all datasets into a single table and label the pipeline
+metadata_swarm_all.tbl <- bind_rows(metadata_100s, metadata_500s,
+                                    metadata_1000s, metadata_10000s) %>%
+  mutate(pipeline = "swarm")                                                      # Add a pipeline identifier column for downstream comparisons across methods
+
+save(metadata_swarm_all.tbl, 
+     file = "path/to/some/directory/metadata_all_swarm_tbl.RData")                # Save the combined metadata table for use in plotting
+```
