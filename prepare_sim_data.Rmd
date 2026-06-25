@@ -14,9 +14,9 @@ knitr::opts_chunk$set(eval = FALSE)
 ## Required Packages
 
 ```{r, message=FALSE, warning=FALSE}
-library(tidyverse)
-library(microseq)
 library(data.table)
+library(microseq)
+library(tidyverse)
 ```
 
 ## Global Settings
