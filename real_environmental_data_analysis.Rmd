@@ -1,0 +1,560 @@
+---
+title: "Analysis of real environmental data"
+author: "Cassandra Stamsaas"
+date: "2026-06-25"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Required Packages
+
+```{r, message=FALSE, warning=FALSE}
+library(microseq)
+library(Rsearch)
+library(tidyverse)
+library(vegan)
+```
+
+## Global Settings
+
+```{r}
+setwd("/path/to/working/directory") # Path to your working directory
+```
+
+
+## Prepare Directories and Paths
+
+```{r}
+path                <- file.path("path", "to", "results")       # Root directory for all output files
+fastq.folder        <- file.path("path", "to", "fastq")         # Directory containing the raw FASTQ files
+fastq_filt.folder   <- file.path(path, "fastq_filtered")        # Directory to store quality-filtered FASTQ files
+fasta_merged.folder <- file.path(path, "fasta_merged")          # Directory to store merged FASTA files
+fasta.folder        <- file.path(path, "fasta")                 # Directory to store dereplicated FASTA files
+metadata.file       <- file.path(fastq.folder, "metadata.tsv")  # Path to the metadata file
+
+if (!dir.exists(fastq_filt.folder))  dir.create(fastq_filt.folder)      # Create the filtered FASTQ directory if it does not already exist
+if (!dir.exists(fasta_merged.folder)) dir.create(fasta_merged.folder)   # Create the merged FASTA directory if it does not already exist
+if (!dir.exists(fasta.folder))       dir.create(fasta.folder)           # Create the dereplicated FASTA directory if it does not already exist
+```
+
+## Metadata
+
+```{r}
+metadata.tbl <- read_tsv(metadata.file) %>% 
+  rename(R1_file = filename,
+         R2_file = filename2) %>%           # Rename filename columns to explicit R1/R2 labels
+  mutate(dereplicated_fasta = NA) %>%       # Placeholder column for the dereplicated FASTA filename, populated during processing
+  mutate(n_reads = 0) %>%                   # Placeholder column for raw read count per sample
+  mutate(n_reads_filtered = 0) %>%          # Placeholder column for read count after quality filtering
+  mutate(n_reads_merged = 0) %>%            # Placeholder column for read count after paired-end merging
+  mutate(n_reads_dereplicated = 0) %>%      # Placeholder column for read count after dereplication
+  mutate(n_reads_wo_chimera = 0) %>%        # Placeholder column for read count after chimera removal
+  filter(Location %in% c(1, 2))             # Retain only samples from locations 1 and 2 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+```
+
+# Plot Base Quality
+
+```{r}
+for(i in 1:nrow(metadata.tbl)){                                              # Iterate over samples to inspect per-base quality profiles
+  R1.tbl <- readFastq(
+    file.path(fastq.folder, metadata.tbl$R1_file[i]))                        # Read the forward FASTQ file for the current sample
+  R2.tbl <- readFastq(
+    file.path(fastq.folder, metadata.tbl$R2_file[i]))                        # Read the reverse FASTQ file for the current sample
+  
+  gg.obj <- plot_base_quality(R1.tbl, 
+                              R2.tbl, 
+                              show_overlap_box = TRUE,
+                              plot_title = paste("Sample:", 
+                                                 metadata.tbl$SampleID[i]))  # Plot per-base quality scores 
+  print(gg.obj)
+  break                                                                      # Remove this line to loop through all samples
+}
+```
+
+# Optimize Trimming
+
+```{r}
+opt.tbl <- tibble(SampleID = metadata.tbl$SampleID,
+                  truncee_rate = 0,
+                  n_merged = 0)                            # Initialize a table to store the optimal truncee rate and merged read count for each sample
+
+for(i in 1:nrow(metadata.tbl)){                            # Iterate over each sample to identify the optimal quality truncation threshold
+  R1.tbl <- readFastq(
+    file.path(fastq.folder, metadata.tbl$R1_file[i]))      # Read the forward FASTQ file for the current sample
+  R2.tbl <- readFastq(
+    file.path(fastq.folder, metadata.tbl$R2_file[i]))      # Read the reverse FASTQ file for the current sample
+  
+  optimize_truncee_rate.tbl <- 
+    vs_optimize_truncee_rate(fastq_input = R1.tbl, 
+                             reverse = R2.tbl)             # Run optimization
+  
+  print(attr(optimize_truncee_rate.tbl, "plot"))           # Display the optimization plot 
+  
+  idx <- 
+    which.max(optimize_truncee_rate.tbl$merged_read_pairs) # Identify the truncee rate that maximizes the number of merged read pairs
+  opt.tbl$truncee_rate[i] <- 
+    optimize_truncee_rate.tbl$truncee_rate_value[idx]      # Store the optimal truncee rate for this sample
+  opt.tbl$n_merged[i]     <- 
+    optimize_truncee_rate.tbl$merged_read_pairs[idx]       # Store the corresponding maximum merged read count for this sample
+}
+
+save(opt.tbl, file = file.path(path, "opt.tbl.RData"))     # Save the optimization results
+```
+
+# Trimming, Merging, Dereplication, and Chimera Detection
+
+```{r}
+load(file.path(path, "opt.tbl.RData"))                                            # Load the previously saved truncee rate optimization results
+
+metadata.tbl <- metadata.tbl %>% 
+  left_join(opt.tbl %>% select(SampleID, truncee_rate), by = "SampleID")          # Attach the optimal truncee rate for each sample to the metadata table
+
+for(i in 1:nrow(metadata.tbl)){                                                   # Iterate over each sample
+  message("Processing sample:", metadata.tbl$SampleID[i])
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))           # Read the forward FASTQ file for the current sample
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i]))           # Read the reverse FASTQ file for the current sample
+  
+  metadata.tbl$n_reads[i] <- nrow(R1.tbl)                                         # Record the total number of raw read pairs for this sample
+  
+  # --------
+  # Trimming
+  # --------
+  cat("Trimming...", "\n")
+  vs_fastx_trim_filt(R1.tbl, R2.tbl,
+                     minlen = 20,                                               # Discard reads shorter than 20 bp after trimming (DADA2 default)
+                     truncee_rate = metadata.tbl$truncee_rate[i],               # Apply the sample-specific truncee rate from the optimization step
+                     maxee_rate = 0.01,                                         # Maximum expected error rate per base, consistent with vs_optimize_truncee_rate
+                     fastqout = file.path(fastq_filt.folder, 
+                                          paste0(metadata.tbl$SampleID[i], 
+                                                 "_R1_filtered.fastq")),        # Output path for filtered forward reads
+                     fastqout_rev = file.path(fastq_filt.folder, 
+                                              paste0(metadata.tbl$SampleID[i], 
+                                                     "_R2_filtered.fastq"))     # Output path for filtered reverse reads
+  )
+  
+  R1_filt.tbl <- readFastq(file.path(fastq_filt.folder,
+                                     paste0(metadata.tbl$SampleID[i], 
+                                            "_R1_filtered.fastq")))             # Read the filtered forward reads back into memory
+  R2_filt.tbl <- readFastq(file.path(fastq_filt.folder,
+                                     paste0(metadata.tbl$SampleID[i], 
+                                            "_R2_filtered.fastq")))             # Read the filtered reverse reads back into memory
+  
+  metadata.tbl$n_reads_filtered[i] <- nrow(R1_filt.tbl)                         # Record the number of read pairs remaining after quality filtering
+  
+  # --------
+  # Merging
+  # --------
+  cat("Merging...", "\n")
+  vs_fastq_mergepairs(R1_filt.tbl, 
+                      R2_filt.tbl,
+                      fastaout = file.path(fasta_merged.folder, 
+                                           paste0(metadata.tbl$SampleID[i], 
+                                                  "_merged.fasta")))        # Merge filtered paired-end reads and write the output to a FASTA file
+  
+  merged.tbl <- readFasta(file.path(fasta_merged.folder, 
+                                    paste0(metadata.tbl$SampleID[i], 
+                                           "_merged.fasta")))               # Read the merged FASTA file back into memory
+  
+  metadata.tbl$n_reads_merged[i] <- nrow(merged.tbl)                        # Record the number of read pairs successfully merged
+  
+  # -------------
+  # Dereplication
+  # -------------
+  cat("Dereplication...", "\n")
+  derep.tbl <- vs_fastx_uniques(fastx_input = merged.tbl)       # Dereplicate merged reads
+  
+  n_derep_reads_total <- derep.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>%
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()                                                       # Sum the size annotations to recover the total number of reads represented after dereplication
+  
+  metadata.tbl$n_reads_dereplicated[i] <- n_derep_reads_total   # Record the total number of reads represented by the dereplicated sequences
+  
+  # -----------------
+  # Chimera detection
+  # -----------------
+  cat("Chimera detection...", "\n")
+  derep_wo_chimera.tbl <- vs_uchime_denovo(derep.tbl)                           # Remove chimeric sequences
+  
+  n_wo_chimera_reads_total <- derep_wo_chimera.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>%
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()                                                                       # Sum the size annotations to recover the total number of reads remaining after chimera removal
+  
+  metadata.tbl$n_reads_wo_chimera[i] <- 
+    n_wo_chimera_reads_total                                                    # Record the total number of reads remaining after chimera removal
+  
+  writeFasta(derep_wo_chimera.tbl, 
+             out.file = file.path(fasta.folder, paste0(metadata.tbl$SampleID[i], 
+                                                       "_dereplicated.fasta"))) # Write the chimera-filtered dereplicated sequences to a FASTA file
+  
+  metadata.tbl$dereplicated_fasta[i] <- 
+    file.path(paste0(metadata.tbl$SampleID[i], "_dereplicated.fasta"))          # Store the output filename in the metadata table for downstream use
+}
+
+save(metadata.tbl, file = file.path(path, "metadata.tbl.RData")) # Save updated metadata table
+```
+
+# Compile FASTA Table Across All Samples
+
+```{r}
+load("path/to/metadata.tbl.RData")                                        # Load the metadata table containing paths to all dereplicated FASTA files
+
+fasta_list <- vector("list", length = nrow(metadata.tbl))                 # Pre-allocate a list to store one FASTA table per sample
+
+for(i in 1:nrow(metadata.tbl)){                                           # Iterate over each sample and read in its dereplicated FASTA file
+  fasta.file <- readFasta(file.path(fasta.folder, 
+                                    metadata.tbl$dereplicated_fasta[i]))  # Read the dereplicated FASTA file for the current sample
+  
+  fasta_list[[i]] <- fasta.file %>% 
+    mutate(
+      size     = as.integer(str_extract(Header, "(?<=size=)\\d+")),       # Parse the dereplicated sequence size (read count) from the FASTA header
+      Location = metadata.tbl$Location[i],                                # Attach the sampling location from the metadata table
+      Station  = metadata.tbl$Station[i],                                 # Attach the station identifier from the metadata table
+      SampleID = metadata.tbl$SampleID[i]                                 # Attach the sample identifier to enable sample-level filtering downstream
+    )
+}
+
+fasta_complete.tbl <- bind_rows(fasta_list)                               # Combine all per-sample FASTA tables into a single table
+
+save(fasta_complete.tbl, file = "path/to/fasta_complete.tbl.RData")       # Save the combined FASTA table for use in downstream analyses
+```
+
+# Prevalence Analysis
+
+## Prevalence Overview in Dereplicated Sequences for a Single Group
+
+```{r}
+# 1. Define the analysis scope
+selected_location <- "2"                                           # Location identifier to subset
+selected_station  <- "C4_fjærsone"                                 # Station identifier to subset
+
+# 2. Filter and prepare the abundance matrix (Location-Station level)
+raw_subset.tbl <- fasta_complete.tbl %>%
+  filter(Location == selected_location, Station == selected_station) %>%  # Retain only sequences from the selected location and station
+  select(SampleID, Sequence, size)                                        # Keep only the columns needed for the abundance matrix
+
+wide_matrix.tbl <- raw_subset.tbl %>%
+  pivot_wider(names_from = Sequence,
+              values_from = size,
+              values_fill = 0)                                    # Reshape to wide format with samples as rows and unique sequences as columns; fill absent sequences with 0
+
+sample_ids   <- wide_matrix.tbl$SampleID                          # Store sample identifiers before converting to a numeric matrix
+count_matrix <- as.matrix(wide_matrix.tbl %>% select(-SampleID))  # Convert to a numeric matrix as required by the vegan package
+rownames(count_matrix) <- sample_ids                              # Restore sample identifiers as row names
+
+# 3. Determine the rarefaction depth based on the sample with the fewest reads
+reads_per_sample <- rowSums(count_matrix)                      # Calculate the total read count per sample
+# n_min <- min(reads_per_sample)                               # Uncomment to rarefy to the minimum observed depth
+n_min <- 10000                                                 # Set a fixed rarefaction depth of 10,000 reads per sample
+cat(paste0("Rarefying all samples in the group to a common depth of: ", n_min, " reads.\n"))
+
+# 4. Perform rarefaction
+set.seed(123)                                                  # Ensure reproducibility of the random subsampling
+rarefied_matrix <- rrarefy(count_matrix, sample = n_min)       # Randomly subsample each sample to n_min reads without replacement
+
+# 5. Reconstruct long format and calculate prevalence
+rarefied_long.tbl <- as.data.frame(rarefied_matrix) %>%
+  rownames_to_column(var = "SampleID") %>%
+  pivot_longer(cols = -SampleID,
+               names_to = "Sequence",
+               values_to = "Subsampled_Size")                  # Reshape the rarefied matrix back to long format, retaining sample identifiers
+
+prevalence_analysis.tbl <- rarefied_long.tbl %>%
+  group_by(Sequence) %>%                                       # Group by unique sequence to calculate per-sequence statistics
+  mutate(
+    Total_Subsampled_Reads = sum(Subsampled_Size),             # Total number of subsampled reads across all samples for this sequence
+    Prevalence_GT = sum(Subsampled_Size > 0)                   # Number of samples in which this sequence is present after rarefaction
+  ) %>%
+  ungroup() %>%
+  filter(Prevalence_GT > 0) %>%                                # Remove sequences that were lost entirely during rarefaction
+  pivot_wider(
+    names_from = SampleID,
+    values_from = Subsampled_Size,
+    names_prefix = "Sample_"                                   
+  ) %>%
+  arrange(desc(Prevalence_GT), desc(Total_Subsampled_Reads))    
+
+prevalence_analysis.tbl
+
+ggplot(prevalence_analysis.tbl) +
+  geom_histogram(aes(x = Prevalence_GT))                      # Plot the distribution of sequence prevalence across samples
+```
+
+## Long-Format Prevalence Table with Reconstructed FASTA Headers
+
+```{r}
+downsampled_data_new_header.tbl <- rarefied_long.tbl %>%
+  filter(Subsampled_Size > 0) %>%                                 # Retain only sequence-sample combinations with at least one read after rarefaction
+  group_by(Sequence) %>%
+  mutate(Prevalence_GT = n()) %>%                                 # Count the number of samples in which each sequence is present
+  ungroup() %>%
+  mutate(Sequence_Index = match(Sequence, unique(Sequence))) %>%  # Assign a unique integer index to each distinct sequence
+  mutate(
+    Header = paste0("Seq_", Sequence_Index,
+                    ";size=", Subsampled_Size)                    # Construct a FASTA-style header containing the sequence index and per-sample read count
+  ) %>%
+  select(Header, SampleID, Sequence, 
+         Subsampled_Size, Prevalence_GT)                          # Retain only relevant columns for downstream use
+
+downsampled_data_new_header.tbl
+```
+
+## Clustering preparations
+
+### Global Dereplication Across All Samples in the Group
+
+```{r}
+input_derep.tbl <- downsampled_data_new_header.tbl %>%
+  select(Header, Sequence)                                  # Extract only the header and sequence columns needed for global dereplication
+
+global_uniques.tbl <- vs_fastx_uniques(input_derep.tbl)     # Dereplicate sequences across all samples combined
+
+global_uniques_size.tbl <- global_uniques.tbl %>% 
+  mutate(size = str_extract(Header, "(?<=;size=)\\d+") %>%
+           as.numeric())                                    # Parse the total read count for each unique sequence from the FASTA header
+```
+
+### Inspect Size Distribution of Global Unique Sequences
+
+```{r}
+p <- table(global_uniques_size.tbl$size) %>% 
+  as.data.frame() %>% 
+  mutate(Var1 = as.numeric(as.character(Var1))) %>%           # Convert size values from factor to numeric for correct axis scaling
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col() +
+  labs(
+    x = "Size",
+    y = "Frequency",
+    title = "Distribution of size"
+  ) +
+  theme_minimal()
+
+p + coord_cartesian(xlim = c(1, 100))                         # Plot the full size distribution up to size 100 to assess the overall range
+p + coord_cartesian(xlim = c(1, 10))                          # Zoom in on the smallest size classes to evaluate the proportion of low-abundance sequences
+```
+
+## Clustering with UNOISE
+
+```{r}
+minsize <- 1                                                      # Set the minimum sequence size for UNOISE
+
+
+unoise.tbl <- vs_cluster_unoise(fasta_input = global_uniques.tbl, # Cluster with UNOISE
+                                minsize = minsize,
+                                threads = 6,
+                                uc = TRUE)                        # Return output in UC format
+
+uc_colnames <- c("record_type", "cluster_number",
+                 "length_size", "percent_similarity",
+                 "match_orientation", "X6", "X7",
+                 "X8", "Header", "centroid_header")
+colnames(unoise.tbl) <- uc_colnames                               # Assign meaningful column names to the UC-format output
+
+unoise_modified.tbl <- unoise.tbl %>% 
+  select(c("record_type", "cluster_number",
+           "Header", "centroid_header")) %>%                      # Retain only the columns needed for downstream result assembly
+  filter(record_type != "C") %>%                                  # Remove cluster summary rows; retain only seed (S) and hit (H) records
+  left_join(global_uniques.tbl, by = "Header")                    # Attach the nucleotide sequence for each cluster member
+
+unoise_modified.tbl
+```
+
+Ground truth abundance for all members of a cluster is summed, and prevalence is recalculated. Sequences excluded from clustering due to insufficient size receive an abundance of 0 in all samples.
+
+```{r}
+res.tbl <- global_uniques.tbl %>%
+  left_join(
+    unoise_modified.tbl %>% 
+      select(record_type, Sequence, cluster_number), 
+    by = "Sequence"                                              # Attach cluster assignments to each unique sequence; sequences below minsize will have NA as cluster_number
+  ) %>%
+  left_join(
+    prevalence_analysis.tbl, 
+    by = "Sequence"                                              # Attach per-sample subsampled read counts and prevalence from the rarefaction step
+  ) %>% 
+  select(-Total_Subsampled_Reads) %>%                            
+  group_by(cluster_number) %>%
+  mutate(
+    across(starts_with("Sample_"),
+           ~ if_else(is.na(cluster_number), 0L, sum(.)))         # Sum per-sample read counts across all members of each cluster; assign 0 to sequences that were not clustered
+  ) %>%
+  ungroup() %>% 
+  mutate(
+    Prevalens_res = rowSums(across(starts_with("Sample_")) > 0)  # Count the number of samples in which each cluster is present after aggregation
+  )
+```
+
+### Clustering Summary Statistics
+
+```{r}
+cat("Number of OTUs: ", length(unique(res.tbl$cluster_number)), "\n")           # Report the total number of clusters produced by UNOISE
+
+cat(paste0("Sequences assigned to a cluster: ", 
+           sum(!is.na(res.tbl$cluster_number)), " (", 
+           round(
+             sum(!is.na(res.tbl$cluster_number))/nrow(res.tbl) * 100, 2), 
+           "%)"), "\n")                                                         # Report the number and proportion of sequences successfully assigned to a cluster
+
+cat(paste0("Sequences excluded due to insufficient size: ", 
+           nrow(global_uniques_size.tbl %>% filter(size < minsize)), " (", 
+           round(nrow(global_uniques_size.tbl %>% 
+                        filter(size < minsize))/nrow(res.tbl) * 100, 2), 
+           "%)"), "\n")                                                         # Report the number and proportion of sequences below the minimum size threshold
+
+cat(paste0("Sequences not assigned to any cluster: ", 
+           sum(is.na(res.tbl$cluster_number)), " (", 
+           round(sum(is.na(res.tbl$cluster_number))/nrow(res.tbl) * 100, 2), 
+           "%)"), "\n")                                                         # Report the number and proportion of sequences that were not assigned to any cluster
+
+cat(paste0("Sequences with prevalence = 0 after clustering: ", 
+           nrow(res.tbl %>% filter(Prevalens_res == 0)), " (", 
+           round(nrow(res.tbl %>% 
+                        filter(Prevalens_res == 0))/nrow(res.tbl) * 100, 2), 
+           "%)", "\n"))                                                         # Report sequences that are present in no samples after cluster-level abundance aggregation
+
+cat("Prevalence profile correlation: ", round(cor(res.tbl$Prevalence_GT, 
+                                                  res.tbl$Prevalens_res), 2))   # Report the Pearson correlation between pre- and post-clustering prevalence profiles
+```
+
+### Sequences Lost per Prevalence Class
+
+```{r}
+summary <- res.tbl %>%
+  group_by(Prevalence_GT) %>%
+  summarise(number_lost = sum(Prevalens_res == 0), .groups = "drop")  # Count the number of sequences that have zero post-clustering prevalence, grouped by their pre-clustering prevalence class
+
+print(summary)
+```
+
+## Clustering with cluster_size
+
+```{r}
+minsize <- 2 # Set the minimum read count 
+id <- 0.99   # Set the sequence similarity threshold
+
+# Identify cluster centroids
+sequence.tbl <- vs_cluster_size(fasta_input = global_uniques_size.tbl %>%
+                                  filter(size >= minsize),    # Exclude sequences below the minimum size threshold before clustering
+                                id = id,
+                                threads = 4,
+                                relabel = "OTU")              # Relabel centroids with sequential OTU identifiers
+
+sequence.tbl
+
+# Calculate per-sample read counts for each OTU
+readcount.tbl <- vs_usearch_global(fastx_input =
+                                     downsampled_data_new_header.tbl %>%
+                                     mutate(Header = paste0(Header, ";sample=", SampleID)) %>%  # Embed the sample identifier in the header to enable per-sample counting
+                                     select(Header, Sequence),
+                                   database = sequence.tbl,                                     # Use the identified centroids as the reference database
+                                   otutabout = TRUE,                                            # Return an OTU table with per-sample read counts
+                                   id = id,
+                                   threads = 4)
+
+readcount.tbl <- readcount.tbl %>% 
+  rename_with(~ paste0("Sample_", .x), -otu_id) # Prefix sample columns to distinguish them from the OTU identifier column
+
+readcount.tbl
+
+# Assign each globally dereplicated sequence to its OTU
+members.tbl <- vs_usearch_global(fastx_input = global_uniques.tbl,
+                                 database = sequence.tbl,          # Map all unique sequences against the OTU centroids
+                                 uc = TRUE,                        # Return output in UC format for downstream parsing
+                                 id = id,
+                                 threads = 4)
+
+uc_colnames <- c("record_type", "cluster_number",
+                 "length", "percent_similarity",
+                 "match_orientation", "X6", "X7",
+                 "X8", "Header", "otu_id")
+colnames(members.tbl) <- uc_colnames # Assign meaningful column names to the UC-format output
+
+members.tbl
+
+members_modified.tbl <- members.tbl %>% 
+  select(c("record_type", "cluster_number",
+           "Header", "otu_id")) %>%                           # Retain only the columns needed for result assembly
+  filter(record_type != "C") %>%                              # Remove cluster summary rows; retain only seed (S), hit (H), and no-hit (N) records
+  left_join(global_uniques.tbl, by = "Header") %>%            # Attach the nucleotide sequence for each entry
+  mutate(cluster_number = ifelse(record_type == "N",
+                                 NA_character_,
+                                 cluster_number)) %>%         # Set cluster_number to NA for sequences that did not match any OTU centroid
+  select(Header, Sequence, record_type, 
+         cluster_number, otu_id) %>%
+  mutate(otu_id = str_remove(otu_id, ";size=\\d+")) %>%       # Strip the size annotation from OTU identifiers to enable joining with the read count table
+  left_join(readcount.tbl, by = "otu_id") %>%                 # Attach per-sample read counts for the OTU each sequence was assigned to
+  left_join(prevalence_analysis.tbl %>%
+              select(Sequence, Prevalence_GT),
+            by = "Sequence") %>%                              # Attach the pre-clustering ground truth prevalence for each sequence
+  mutate(
+    across(starts_with("Sample_"),
+           ~ if_else(is.na(cluster_number), 0L, .x))          # Set per-sample read counts to 0 for sequences not assigned to any OTU
+  ) %>% 
+  mutate(
+    Prevalens_res = rowSums(
+      across(starts_with("Sample_")) > 0)                    # Count the number of samples in which each OTU is present after clustering
+  )
+```
+
+### Clustering Summary Statistics
+
+```{r}
+cat("Number of OTUs: ", length(unique(members_modified.tbl$cluster_number)), 
+    "\n") # Report the total number of OTUs produced
+
+cat(paste0(
+  "Sequences assigned to a cluster: ", 
+  sum(!is.na(members_modified.tbl$cluster_number)), " (", 
+  round(sum(!is.na(members_modified.tbl$cluster_number))/nrow(members_modified.tbl) * 100, 2), 
+  "%)"), "\n") # Report the number and proportion of sequences successfully assigned to an OTU
+
+cat(paste0("Sequences excluded due to insufficient size: ", 
+           nrow(global_uniques_size.tbl %>% filter(size < minsize)), " (", 
+           round(nrow(global_uniques_size.tbl %>% filter(size < minsize))/nrow(global_uniques_size.tbl) * 100, 2), 
+           "%)"), "\n")  # Report the number and proportion of sequences below the minimum size threshold
+
+cat(paste0(
+  "Sequences not assigned to any cluster: ", 
+  sum(is.na(members_modified.tbl$cluster_number)), " (", 
+  round(sum(is.na(members_modified.tbl$cluster_number))/nrow(members_modified.tbl) * 100, 2), 
+  "%)"), "\n") # Report the number and proportion of sequences that did not match any OTU centroid
+
+cat(paste0(
+  "Sequences with prevalence = 0 after clustering: ", 
+  nrow(members_modified.tbl %>% filter(Prevalens_res == 0)), " (", 
+  round(nrow(members_modified.tbl %>% filter(Prevalens_res == 0))/nrow(members_modified.tbl) * 100, 2), 
+  "%)", "\n"))  # Report sequences present in no samples after cluster-level abundance aggregation
+
+cat("Prevalence profile correlation: ", 
+    round(cor(members_modified.tbl$Prevalence_GT, 
+              members_modified.tbl$Prevalens_res), 2))  # Report the Pearson correlation between pre- and post-clustering prevalence profiles
+```
+
+### Sequences Lost per Prevalence Class
+
+```{r}
+summary <- members_modified.tbl %>%
+  group_by(Prevalence_GT) %>%
+  summarise(number_lost = sum(Prevalens_res == 0), .groups = "drop")  # Count the number of sequences with zero post-clustering prevalence, grouped by pre-clustering prevalence class
+
+print(summary)
+```
