@@ -1,0 +1,1188 @@
+---
+title: "Processing and Clustering of Simulated Data Using the Rsearch Package"
+author: "Cassandra Stamsaas"
+date: "2026-07-23"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Required Packages
+
+```{r, message=FALSE, warning=FALSE}
+library(forcats)
+library(mclust)
+library(microseq)
+library(Rsearch)
+library(tidyverse)
+```
+
+## Global Settings
+
+```{r}
+setwd("/path/to/working/directory") # Path to your working directory
+```
+
+## Prepare Directories and Paths
+
+```{r}
+path                <- "1000_species_10_dynamic"          # Define dataset to process
+fastq.folder        <- file.path(path, "fastq")           # Directory containing the raw FASTQ files
+fastq_filt.folder   <- file.path(path, "fastq_filtered")  # Directory containing quality-filtered FASTQ files
+fasta_merged.folder <- file.path(path, "fasta_merged")    # Directory containing merged FASTA files
+rsearch_dir         <- file.path(path, "rsearch_results") # Directory containing Rsearch output
+fasta.folder        <- file.path(rsearch_dir, "fasta")    # Directory containing dereplicated FASTA files
+metadata.file       <- file.path(path, "metadata.tsv")    # Path to the metadata file
+
+# ------------------
+# cluster_size paths
+# ------------------
+
+cluster_size_folder                  <- file.path(rsearch_dir, 
+                                                  "cluster_size")     # Directory containing cluster_size results
+dominant_species_folder_cluster_size <- file.path(cluster_size_folder, 
+                                                  "dominant_species") # Directory containing dominant-species assignments for each cluster
+abundance_folder_cluster_size        <- file.path(cluster_size_folder, 
+                                                  "abundance_tables") # Directory containing observed and ground truth abundance tables
+noise_seqs_cluster_size              <- file.path(cluster_size_folder, 
+                                                  "noise_seqs")       # Directory containing sequences classified as noise
+
+# --------------------
+# cluster_unoise paths
+# --------------------
+
+cluster_unoise_folder                  <- file.path(rsearch_dir, 
+                                                    "cluster_unoise_8") # Directory containing cluster_unoise results
+
+dominant_species_folder_cluster_unoise <- file.path(cluster_unoise_folder, 
+                                                    "dominant_species") # Directory containing dominant-species assignments for each cluster
+
+abundance_folder_cluster_unoise        <- file.path(cluster_unoise_folder, 
+                                                    "abundance_tables") # Directory containing observed and ground truth abundance tables
+
+noise_seqs_cluster_unoise              <- file.path(cluster_unoise_folder, 
+                                                    "noise_seqs")       # Directory containing sequences classified as noise
+
+# ----------------------------
+# Create required directories
+# ----------------------------
+
+if (!dir.exists(fastq_filt.folder)) {
+  dir.create(fastq_filt.folder)
+}
+
+if (!dir.exists(fasta_merged.folder)) {
+  dir.create(fasta_merged.folder)
+}
+
+if (!dir.exists(rsearch_dir)) {
+  dir.create(rsearch_dir)
+}
+
+if (!dir.exists(fasta.folder)) {
+  dir.create(fasta.folder)
+}
+
+# Create directories for cluster_size output
+if (!dir.exists(cluster_size_folder)) {
+  dir.create(cluster_size_folder)
+}
+
+if (!dir.exists(dominant_species_folder_cluster_size)) {
+  dir.create(dominant_species_folder_cluster_size)
+}
+
+if (!dir.exists(abundance_folder_cluster_size)) {
+  dir.create(abundance_folder_cluster_size)
+}
+
+if (!dir.exists(noise_seqs_cluster_size)) {
+  dir.create(noise_seqs_cluster_size)
+}
+
+# Create directories for cluster_unoise output
+if (!dir.exists(cluster_unoise_folder)) {
+  dir.create(cluster_unoise_folder)
+}
+
+if (!dir.exists(dominant_species_folder_cluster_unoise)) {
+  dir.create(dominant_species_folder_cluster_unoise)
+}
+
+if (!dir.exists(abundance_folder_cluster_unoise)) {
+  dir.create(abundance_folder_cluster_unoise)
+}
+
+if (!dir.exists(noise_seqs_cluster_unoise)) {
+  dir.create(noise_seqs_cluster_unoise)
+}
+```
+
+## Metadata
+
+```{r}
+# Read metadata file and add columns for results
+metadata.tbl <- read_tsv(metadata.file) %>% 
+  select(-c(community_id, amplicon_file)) %>%
+  mutate(dereplicated_fasta = NA) %>%
+  rename(n_reads = readpairs) %>% 
+  mutate(dataset = path) %>%
+  mutate(n_reads_filtered = 0) %>% 
+  mutate(n_reads_merged = 0) %>% 
+  mutate(n_reads_dereplicated = 0) %>% 
+  mutate(n_reads_wo_chimera = 0) %>% 
+  mutate(n_clusters = 0) %>% 
+  mutate(n_pure_clusters = 0) %>%
+  mutate(n_perfect_clusters = 0) %>%
+  mutate(average_purity_score = 0) %>%
+  mutate(n_species = 0) %>% 
+  mutate(n_species_filtered = 0) %>% 
+  mutate(n_species_merged = 0) %>% 
+  mutate(n_species_dereplicated = 0) %>% 
+  mutate(n_species_wo_chimera = 0) %>% 
+  mutate(n_species_pre_clustering = 0) %>% 
+  mutate(n_species_represented = 0) %>% 
+  mutate(n_species_with_multiple_clusters = 0) %>% 
+  mutate(abundance_correlation = 0)
+```
+
+## Plot Base Quality
+
+```{r}
+for (i in 1:nrow(metadata.tbl)) {                                       # Iterate over samples in the metadata table
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) # Read forward (R1) FASTQ reads for the current sample
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i])) # Read reverse (R2) FASTQ reads for the current sample
+  
+  gg.obj <- plot_base_quality(
+    R1.tbl, 
+    R2.tbl, 
+    show_overlap_box = TRUE,
+    plot_title = paste("Sample:", metadata.tbl$sample_id[i])) # Create plot
+  
+  print(gg.obj)                                               # Visualize plot                 
+  
+  break # Remove this line to inspect base quality profiles for all samples
+}
+```
+
+# Optimize Trimming 
+
+## Optimize truncee_rate
+
+```{r}
+opt.tbl <- tibble(
+  sample_id = metadata.tbl$sample_id,
+  truncee_rate = 0,
+  n_merged = 0) # Initialize a table for storing optimized truncation parameters and merging results
+
+for (i in 1:nrow(metadata.tbl)) { # Iterate over samples in the metadata table
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) # Read forward (R1) FASTQ reads for the current sample
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i])) # Read reverse (R2) FASTQ reads for the current sample
+  
+  optimize_truncee_rate.tbl <- vs_optimize_truncee_rate(
+    fastq_input = R1.tbl, 
+    reverse = R2.tbl) # Run optimization function for truncee_rate
+  
+  print(attr(optimize_truncee_rate.tbl, "plot")) # Display the optimization results plot
+  
+  # -----------------------
+  # Select optimal setting
+  # -----------------------
+  
+  idx <- which.max(optimize_truncee_rate.tbl$merged_read_pairs) # Identify the truncee_rate yielding the highest number of merged read pairs
+  
+  opt.tbl$truncee_rate[i] <- 
+    optimize_truncee_rate.tbl$truncee_rate_value[idx]           # Record the optimal truncee_rate for the current sample
+  
+  opt.tbl$n_merged[i] <- 
+    optimize_truncee_rate.tbl$merged_read_pairs[idx]            # Record the corresponding number of successfully merged read pairs
+}
+
+save(
+  opt.tbl,
+  file = file.path(rsearch_dir, "opt.tbl.RData")) # Save optimized truncation parameters for downstream processing
+```
+
+# Trimming, Merging, Dereplication, and Chimera Detection
+
+```{r}
+load(file.path(rsearch_dir, "opt.tbl.RData")) # Load optimized truncee_rate values for each sample
+
+for(i in 1:nrow(metadata.tbl)){ # Iterate over each sample in the metadata table
+  
+  message(paste0("Processing sample ", 
+                 metadata.tbl$sample_id[i], 
+                 " (", i, "/", nrow(metadata.tbl), ")"))
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) # Read forward (R1) FASTQ reads for the current sample
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i])) # Read reverse (R2) FASTQ reads for the current sample
+  
+  # -------------------------
+  # Initial species richness
+  # -------------------------
+  
+  df <- R1.tbl %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)"))    # Extract the ground truth species label from each read header
+  
+  metadata.tbl$n_species[i] <- length(unique(df$species)) # Record the number of species present before read processing
+  
+  # --------------------
+  # Trim and filter reads
+  # --------------------
+  
+  cat("Trimming...", "\n")
+  
+  vs_fastx_trim_filt(
+    R1.tbl, 
+    R2.tbl,
+    minlen = 20,                            # Minimum retained read length; default used by DADA2
+    truncee_rate = opt.tbl$truncee_rate[i], # Apply the optimized truncation parameter for the current sample
+    maxee_rate = 0.01,                      # Maximum expected-error rate used during truncee_rate optimization
+    fastqout = file.path(
+      fastq_filt.folder, 
+      paste0(metadata.tbl$sample_id[i], "_R1_filtered.fastq")
+    ),
+    fastqout_rev = file.path(
+      fastq_filt.folder, 
+      paste0(metadata.tbl$sample_id[i], "_R2_filtered.fastq"))) # Trim and quality-filter paired-end reads and write filtered FASTQ files
+  
+  R1_filt.tbl <- readFastq(
+    file.path(
+      fastq_filt.folder, 
+      paste0(metadata.tbl$sample_id[i], "_R1_filtered.fastq"))) # Read filtered forward reads
+  
+  R2_filt.tbl <- readFastq(
+    file.path(
+      fastq_filt.folder, 
+      paste0(metadata.tbl$sample_id[i], "_R2_filtered.fastq"))) # Read filtered reverse reads
+  
+  metadata.tbl$n_reads_filtered[i] <- nrow(R1_filt.tbl) # Record the number of read pairs retained after filtering
+  
+  df <- R1_filt.tbl %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)"))             # Extract ground truth species labels from filtered reads
+  
+  metadata.tbl$n_species_filtered[i] <- length(unique(df$species)) # Record the number of species represented after filtering
+  
+  # ----------------
+  # Merge read pairs
+  # ----------------
+  
+  cat("Merging...", "\n")
+  
+  vs_fastq_mergepairs(R1_filt.tbl, 
+                      R2_filt.tbl,
+                      fastaout = file.path(
+                        fasta_merged.folder, 
+                        paste0(metadata.tbl$sample_id[i], "_merged.fasta"))) # Merge overlapping forward and reverse reads and write merged sequences to FASTA
+  
+  merged.tbl <- readFasta(
+    file.path(fasta_merged.folder, 
+              paste0(metadata.tbl$sample_id[i], "_merged.fasta"))) # Read merged sequences for downstream processing
+  
+  metadata.tbl$n_reads_merged[i] <- nrow(merged.tbl) # Record the number of successfully merged read pairs
+  
+  df <- merged.tbl %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Extract ground truth species labels from merged reads
+  
+  metadata.tbl$n_species_merged[i] <- length(unique(df$species)) # Record the number of species represented after merging
+  
+  # -------------
+  # Dereplication
+  # -------------
+  
+  cat("Dereplication...", "\n")
+  
+  derep.tbl <- vs_fastx_uniques(fastx_input = merged.tbl) # Dereplicate sequences
+  
+  n_derep_reads_total <- derep.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>% # Extract the read abundance encoded in each dereplicated FASTA header
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()                                                     # Recover the total number of reads represented by dereplicated sequences
+  
+  metadata.tbl$n_reads_dereplicated[i] <- n_derep_reads_total # Record the total read count represented after dereplication
+  
+  df <- derep.tbl %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Extract ground truth species labels from dereplicated sequences
+  
+  metadata.tbl$n_species_dereplicated[i] <- 
+    length(unique(df$species)) # Record the number of species represented after dereplication
+  
+  # -----------------
+  # Chimera detection
+  # -----------------
+  
+  cat("Chimera detection...", "\n")
+  
+  derep_wo_chimera.tbl <- vs_uchime_denovo(derep.tbl) # Detect and remove chimeric sequences from the dereplicated dataset
+  
+  n_wo_chimera_reads_total <- derep_wo_chimera.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>% # Extract the abundance of each non-chimeric dereplicated sequence
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()                                                     # Calculate the total number of reads retained after chimera removal
+  
+  metadata.tbl$n_reads_wo_chimera[i] <- n_wo_chimera_reads_total # Record the number of reads retained after chimera removal
+  
+  df <- derep_wo_chimera.tbl %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Extract ground truth species labels from non-chimeric sequences
+  
+  metadata.tbl$n_species_wo_chimera[i] <- length(unique(df$species)) # Record the number of species represented after chimera removal
+  
+  # -----------------------------
+  # Write processed FASTA output
+  # -----------------------------
+  
+  writeFasta(
+    derep_wo_chimera.tbl, 
+    out.file = file.path(
+      fasta.folder, 
+      paste0(metadata.tbl$sample_id[i], "_dereplicated.fasta"))) # Write dereplicated, non-chimeric sequences to FASTA for downstream clustering
+  
+  metadata.tbl$dereplicated_fasta[i] <- 
+    file.path(paste0(metadata.tbl$sample_id[i], "_dereplicated.fasta")) # Record the dereplicated FASTA filename in the metadata table
+}
+
+save(metadata.tbl, 
+     file = file.path(rsearch_dir, "metadata.tbl.RData")) # Save the metadata table with read- and species-level processing statistics    
+```
+
+# cluster_size Clustering
+
+```{r}
+id      <- 0.99 # Sequence identity threshold used for clustering and noise-sequence mapping
+minsize <- 2    # Minimum sequence abundance required for inclusion in initial clustering
+
+load(file.path(rsearch_dir, "metadata.tbl.RData")) # Load metadata generated during read preprocessing
+
+for (i in 1:nrow(metadata.tbl)) { # Iterate over each sample in the metadata table
+  
+  message(paste0("Processing sample ", 
+                 metadata.tbl$sample_id[i], 
+                 " (", i, "/", nrow(metadata.tbl), ")"))
+  
+  # ---------------------------
+  # Load and parse input data
+  # ---------------------------
+  
+  all.tbl <- readFasta(file.path(
+    fasta.folder, metadata.tbl$dereplicated_fasta[i])) %>%                       # Read dereplicated sequences for current sample
+    mutate(actual_cluster = Header,
+           actual_cluster = str_match(actual_cluster, 
+                                      "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>% # Extract the ground truth species label from each FASTA header
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+") %>% 
+             as.numeric())                                                       # Parse sequence abundance (read count) from each dereplicated FASTA header
+  
+  metadata.tbl$n_species_pre_clustering[i] <- 
+    length(unique(all.tbl$actual_cluster)) # Record the number of species represented immediately before clustering
+  
+  # ---------------------------------
+  # Separate "bio" and noise sequences
+  # ---------------------------------
+  
+  bio_seqs.tbl <- all.tbl %>%
+    filter(size >= minsize) # Retain sequences meeting the minimum abundance threshold for initial clustering
+  
+  noise_seqs.tbl <- all.tbl %>%
+    filter(size < minsize)  # Separate low-abundance sequences excluded from initial initial clustering
+  
+  
+  # -----------------------
+  # Clustering
+  # -----------------------
+  
+  centroids_uc.tbl <- vs_cluster_size(
+    bio_seqs.tbl, 
+    uc = TRUE,
+    sizeout = FALSE,
+    id = id,
+    size_column = TRUE,
+    threads = 4) # Cluster "bio" sequences to find centroids and return results in UC-format
+  
+  uc_colnames <- c(
+    "record_type", "cluster_number", 
+    "length_size", "percent_similarity", 
+    "match_orientation", "X6", "X7", 
+    "X8", "X9", "X10")
+  
+  colnames(centroids_uc.tbl) <- uc_colnames # Assign informative column names to the UC-format clustering output
+  
+  metadata.tbl$n_clusters[i] <- 
+    length(unique(centroids_uc.tbl$cluster_number)) # Record the number of clusters generated for the current sample
+  
+  # --------------------------
+  # Prepare centroid database
+  # --------------------------
+  
+  db.tbl <- centroids_uc.tbl %>% 
+    filter(record_type == "S") %>%         # Retain centroid (seed) sequences from each predicted cluster
+    rename(Header = X9) %>% 
+    select(Header) %>% 
+    left_join(bio_seqs.tbl, by = "Header") # Attach nucleotide sequences to centroid headers
+  
+  # -----------------------------
+  # Map low-abundance sequences
+  # -----------------------------
+  
+  if (nrow(noise_seqs.tbl) > 0) {
+    noise_mapped.tbl <- vs_usearch_global(
+      noise_seqs.tbl, 
+      uc = TRUE,
+      database = db.tbl,
+      id = id,
+      threads = 4) # Map low-abundance sequences against cluster centroids using the same identity threshold
+    
+    noise_colnames <- c(
+      "record_type", "cluster_number", 
+      "length", "percent_similarity", 
+      "match_orientation", "X6", "X7", 
+      "X8", "query", "target")
+    
+    colnames(noise_mapped.tbl) <- noise_colnames # Assign informative column names to the UC-format mapping output
+  }
+  
+  # ---------------------------------
+  # Parse initial clustering results
+  # ---------------------------------
+  
+  c.tbl <- centroids_uc.tbl %>% 
+    rename(
+      Header = X9,
+      centroid = X10) %>%                                        # Rename positional UC columns to meaningful names
+    select(-c(
+      "length_size", "match_orientation", "X6", "X7", "X8")) %>% # Remove UC columns not required for downstream analysis
+    filter(record_type != "C") %>%                               # Remove cluster summary records
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>%    # Extract sequence abundance from the FASTA header
+    mutate(size = as.numeric(size)) %>% 
+    mutate(cluster_number = as.character(cluster_number)) %>% 
+    mutate(centroid = ifelse(centroid == "*", Header, centroid)) # Replace the centroid placeholder with the sequence's own header for seed records
+  
+  # ----------------------------------
+  # Parse mapped low-abundance sequences
+  # ----------------------------------
+  
+  if (nrow(noise_seqs.tbl) > 0) {
+    
+    n.tbl <- noise_mapped.tbl %>% 
+      rename(
+        Header = query,
+        centroid = target) %>%                                  # Rename query and target fields for consistency with the clustering results
+      select(-c(
+        "length", "match_orientation", "X6", "X7", "X8")) %>%   # Remove UC columns not required for downstream analysis
+      mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>% # Parse sequence abundance from each query header
+      mutate(size = as.numeric(size)) %>% 
+      mutate(
+        cluster_number = ifelse(
+          cluster_number != "*", cluster_number, NA)) %>%       # Assign NA to sequences that could not be mapped to a cluster
+      mutate(centroid = ifelse(centroid == "*", NA, centroid))  # Assign NA where no centroid match was identified
+    
+    metadata.tbl$n_reads_not_clustered[i] <- 
+      sum(
+        n.tbl %>% 
+          filter(record_type == "N") %>% 
+          select(size)) # Record the total number of reads represented by unmapped low-abundance sequences
+    
+    metadata.tbl$n_unique_reads_not_clustered[i] <-
+      nrow(
+        n.tbl %>% 
+          filter(record_type == "N")) # Record the number of unique low-abundance sequences that remained unmapped
+    
+  } else {
+    
+    n.tbl <- tibble(
+      record_type = character(),
+      cluster_number = character(),
+      percent_similarity = character(),
+      Header = character(),
+      centroid = character(),
+      size = numeric()) # Create an empty table with the expected structure when no low-abundance sequences are present
+    
+    metadata.tbl$n_reads_not_clustered[i]        <- 0 # No reads remained unclustered
+    metadata.tbl$n_unique_reads_not_clustered[i] <- 0 # No unique sequences remained unclustered
+  }
+  
+  # Save n.tbl for later
+  save(n.tbl, file = file.path(
+    noise_seqs_cluster_size,
+    paste0("noise_sequences_", metadata.tbl$sample_id[i], ".RData"))) # Save mapped and unmapped low-abundance sequences for downstream inspection
+  
+  # --------------------------------
+  # Non-clustered species statistics
+  # --------------------------------
+  
+  # Get metadata statistics for non-clustered species
+  df1 <- n.tbl %>% 
+    mutate(
+      taxonomy = Header,
+      taxonomy = str_match(taxonomy, "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) # Extract ground truth species labels from low-abundance sequences
+  
+  df2 <- c.tbl %>% 
+    mutate(
+      taxonomy = Header,
+      taxonomy = str_match(taxonomy, "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) # Extract ground truth species labels from clustered sequences
+  
+  missing_in_hits <- anti_join(
+    df1 %>% 
+      filter(record_type == "N"), 
+    bind_rows(df2, df1 %>% filter(record_type == "H")), 
+    by = "taxonomy") # Identify species represented only by unmapped sequences and absent from all clustered or mapped sequences
+  
+  metadata.tbl$n_species_not_clustered[i] <- 
+    n_distinct(missing_in_hits$taxonomy) # Record the number of species completely absent from the final clustering results
+  
+  # ----------------------------------
+  # Combine all clustering assignments
+  # ----------------------------------
+  
+  res.tbl <- bind_rows(c.tbl, n.tbl) %>%
+    arrange(cluster_number) %>% 
+    mutate(
+      predicted_cluster = centroid,
+      predicted_cluster = str_match(
+        predicted_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>% # Extract the taxonomic identity of the centroid as the predicted cluster identity
+    mutate(
+      actual_cluster = Header,
+      actual_cluster = str_match(
+        actual_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>%    # Extract the ground truth species identity of each sequence
+    left_join(all.tbl %>% select(Header, Sequence), by = "Header")    # Attach nucleotide sequences to clustering assignments
+  
+  # ---------------
+  # Purity analysis
+  # ---------------
+  
+  clustering_results.tbl <- res.tbl # Alias for readability in downstream clustering analyses
+  
+  cluster_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number) %>%
+    summarise(
+      total_reads = sum(size),
+      distinct_actual_clusters = 
+        n_distinct(actual_cluster),    # Count number of distinct actual clusters in the predicted cluster
+      .groups = "drop"
+    ) %>%
+    mutate(status = ifelse(            
+      distinct_actual_clusters == 1,
+      "Pure",
+      "Mixed")) %>%                    # Classify clusters as pure (single species) or mixed (multiple species)
+    arrange(status, desc(total_reads)) # Sort clusters by purity status and descending read count
+  
+  metadata.tbl$n_pure_clusters[i] <- 
+    sum(cluster_summary$status == "Pure") # Record the number of pure clusters for the current sample
+  
+  purity_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(size_per_group = sum(size), 
+              .groups = "drop_last") %>%              # Sum read counts for each species within each predicted cluster
+    arrange(desc(size_per_group)) %>%
+    summarise(
+      total_cluster_size = sum(size_per_group),       # Total number of reads assigned to the predicted cluster
+      dominant_actual = first(actual_cluster),        # Ground truth species contributing the largest number of reads
+      dominant_size = first(size_per_group),          # Number of reads contributed by the dominant species
+      purity_pct = dominant_size / total_cluster_size # Cluster purity: proportion of reads belonging to the dominant species
+    ) %>%
+    arrange(purity_pct)
+  
+  total_reads <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>% 
+    select(size) %>% 
+    sum() # Calculate the total number of reads assigned to predicted clusters
+  
+  metadata.tbl$average_purity_score[i] <- 
+    mean(purity_summary$purity_pct) # Calculate mean purity across individual predicted clusters
+  
+  # -------------------------
+  # Perfect clusters analysis
+  # -------------------------
+  
+  input_totals <- all.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(
+      total_size_in = sum(size, na.rm = TRUE), 
+      .groups = "drop") # Calculate the total input read count for each species before clustering
+  
+  cluster_summary <- clustering_results.tbl %>%
+    group_by(cluster_number) %>%
+    summarise(
+      n_species_in_cluster = n_distinct(actual_cluster), # Count the number of distinct species within each predicted cluster
+      cluster_species = first(actual_cluster),           # Record species identity for single-species clusters
+      total_size_out = sum(size, na.rm = TRUE),          # Calculate the total number of reads represented by each cluster
+      .groups = "drop"
+    )
+  
+  species_distribution <- clustering_results.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(
+      n_groups_for_species = n_distinct(
+        cluster_number, 
+        na.rm = FALSE), # Count how many predicted clusters each ground truth species is distributed across
+      .groups = "drop")
+  
+  perfect_clusters <- cluster_summary %>%
+    filter(!is.na(cluster_number)) %>%
+    filter(n_species_in_cluster == 1) %>%   # Retain only clusters containing a single species
+    left_join(
+      species_distribution, 
+      by = c("cluster_species" = "actual_cluster")
+    ) %>%
+    filter(n_groups_for_species == 1) %>%   # Retain only species represented by exactly one predicted cluster
+    left_join(
+      input_totals, 
+      by = c("cluster_species" = "actual_cluster")
+    ) %>%
+    filter(total_size_out == total_size_in) # Retain clusters containing all reads belonging to the corresponding species
+  
+  metadata.tbl$n_perfect_clusters[i] <- 
+    nrow(perfect_clusters) # Record the number of perfect clusters: pure, non-split, and complete
+  
+  
+  # ------------------------------------------
+  # Represented species and abundance profiles
+  # ------------------------------------------
+  
+  dominant_species_per_cluster <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(
+      total_size = sum(size), 
+      .groups = "drop_last"
+    ) %>%
+    arrange(cluster_number, desc(total_size)) %>%
+    summarise(
+      dominant_actual_cluster = first(actual_cluster), 
+      .groups = "drop") # Assign each predicted cluster to the species contributing the largest number of reads
+  
+  save(
+    dominant_species_per_cluster,
+    file = file.path(
+      dominant_species_folder_cluster_size,
+      paste0(
+        "dominant_species_per_cluster_",
+        metadata.tbl$sample_id[i],
+        ".RData"))) # Save dominant-species assignments for downstream abundance analysis
+  
+  metadata.tbl$n_species_represented[i] <- 
+    length(unique(dominant_species_per_cluster$dominant_actual_cluster)) # Record the number of species represented by at least one predicted cluster
+  
+  n_species_with_multiple_clusters <- dominant_species_per_cluster %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(
+      n_clusters = n(), 
+      .groups = "drop"
+    ) %>%
+    filter(n_clusters >= 2) %>%
+    nrow() # Count species that dominate multiple predicted clusters (over-splitting)
+  
+  metadata.tbl$n_species_with_multiple_clusters[i] <- 
+    n_species_with_multiple_clusters # Record the number of over-split species
+  
+  # ------------------
+  # Abundance analysis
+  # ------------------
+  
+  fq <- readFastq(
+    file.path(fastq.folder, metadata.tbl$R1_file[i])
+  ) %>%
+    mutate(
+      actual_cluster = Header,
+      actual_cluster = str_match(
+        actual_cluster, 
+        "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) # Read raw R1 reads and extract the ground truth species identity
+  
+  abundance_per_initiate_species <- fq %>%
+    group_by(actual_cluster) %>%
+    summarise(
+      gold_standard_n = n(), 
+      .groups = "drop"
+    ) %>%
+    mutate(
+      gold_standard_rel_abundance = 
+        gold_standard_n / sum(gold_standard_n)
+    ) %>%
+    arrange(desc(gold_standard_rel_abundance)) # Calculate ground truth relative abundance directly from raw read counts
+  
+  abundance_per_species <- clustering_results.tbl %>%
+    left_join(
+      dominant_species_per_cluster, 
+      by = "cluster_number"
+    ) %>% 
+    mutate(
+      dominant_actual_cluster = replace_na(
+        dominant_actual_cluster, 
+        "Unassigned"
+      )
+    ) %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(
+      n = sum(size), 
+      .groups = "drop"
+    ) %>%
+    mutate(rel_abundance = n / sum(n)) %>%
+    arrange(desc(rel_abundance)) %>%
+    rename(actual_cluster = dominant_actual_cluster) # Calculate observed species relative abundance from the clustering results
+  
+  abundance.tbl <- abundance_per_initiate_species %>%
+    left_join(
+      abundance_per_species, 
+      by = "actual_cluster"
+    ) %>%
+    mutate(
+      n = replace_na(n, 0),
+      rel_abundance = replace_na(rel_abundance, 0)) # Combine ground truth and observed abundance profiles and assign zero to missing species
+  
+  save(
+    abundance.tbl,
+    file = file.path(
+      abundance_folder_cluster_size,
+      paste0(
+        "abundance_",
+        metadata.tbl$sample_id[i],
+        ".RData"))) # Save abundance profiles for downstream comparisons
+  
+  metadata.tbl$abundance_correlation[i] <- cor(
+    abundance.tbl$gold_standard_rel_abundance, 
+    abundance.tbl$rel_abundance) # Calculate Pearson correlation between ground truth and observed relative abundances
+}
+
+save(
+  metadata.tbl, 
+  file = file.path(cluster_size_folder, "metadata.tbl.RData")) # Save metadata with all cluster_size performance statistics
+```
+
+## Plotting Preparations After Processing All Datasets
+
+```{r}
+# IMPORTANT:
+# Run this section only after all datasets have been fully processed with the
+# cluster_size pipeline. The code below loads the final metadata table from
+# each dataset and combines them into a single table for downstream plotting
+# and comparative analyses.
+
+# --------------------------------
+# Load per-dataset metadata tables
+# --------------------------------
+
+load("100_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_100s_10d.tbl <- metadata.tbl
+
+load("100_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_100s_100d.tbl <- metadata.tbl
+
+load("1000_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_1000s_10d.tbl <- metadata.tbl
+
+load("1000_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_1000s_100d.tbl <- metadata.tbl                                        
+
+load("10000_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_10000s_10d.tbl <- metadata.tbl                                     
+
+load("10000_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_10000s_100d.tbl <- metadata.tbl                                        
+
+# --------------------------------------------
+# Combine datasets by simulated species richness
+# --------------------------------------------
+
+metadata_100s <- bind_rows(
+  metadata_100s_10d.tbl,
+  metadata_100s_100d.tbl) # Combine all 100-species datasets across dynamic ranges
+
+metadata_1000s <- bind_rows(
+  metadata_1000s_10d.tbl,
+  metadata_1000s_100d.tbl) # Combine all 1000-species datasets across dynamic ranges
+
+metadata_10000s <- bind_rows(
+  metadata_10000s_10d.tbl,
+  metadata_10000s_100d.tbl) # Combine all 10000-species datasets across dynamic ranges
+
+# --------------------------------
+# Combine all processed datasets
+# --------------------------------
+
+metadata_cluster_size_all.tbl <- bind_rows(
+  metadata_100s,
+  metadata_1000s,
+  metadata_10000s) %>%
+  mutate(pipeline = "cluster_size") # Add a pipeline identifier for downstream comparisons across clustering methods
+
+save(
+  metadata_cluster_size_all.tbl,
+  file = "metadata_all_cluster_size_tbl.RData") # Save the combined metadata table for downstream plotting and comparative analyses
+```
+
+# UNOISE clustering
+
+```{r}
+minsize <- 8 # Minimum sequence abundance required for UNOISE clustering
+
+load(file.path(rsearch_dir, "metadata.tbl.RData")) # Load metadata generated during read preprocessing
+
+for (i in 1:nrow(metadata.tbl)) { # Iterate over each sample in the metadata table
+  
+  message(paste0("Processing sample ", 
+                 metadata.tbl$sample_id[i], 
+                 " (", i, "/", nrow(metadata.tbl), ")"))
+  
+  # ---------------------------
+  # Load and parse input data
+  # ---------------------------
+  
+  all.tbl <- readFasta(file.path(
+    fasta.folder, metadata.tbl$dereplicated_fasta[i])) %>%                       # Read dereplicated sequences for current sample
+    mutate(actual_cluster = Header,
+           actual_cluster = str_match(actual_cluster, 
+                                      "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>% # Extract the ground truth species label from each FASTA header
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+") %>% 
+             as.numeric())                                                       # Parse sequence abundance (read count) from each dereplicated FASTA header
+  
+  metadata.tbl$n_species_pre_clustering[i] <- 
+    length(unique(all.tbl$actual_cluster)) # Record the number of species represented immediately before clustering
+  
+  # -----------------
+  # UNOISE clustering
+  # -----------------
+  
+  centroids_unoise.tbl <- vs_cluster_unoise(
+    all.tbl,
+    uc = TRUE,
+    minsize = minsize,
+    threads = 4) # Perform UNOISE clustering and return sequence assignments in UC format
+  
+  uc_colnames <- c(
+    "record_type", "cluster_number", 
+    "length_size", "percent_similarity", 
+    "match_orientation", "X6", "X7", 
+    "X8", "X9", "X10")
+  
+  colnames(centroids_unoise.tbl) <- uc_colnames # Assign informative column names to the UC-format clustering output
+  
+  metadata.tbl$n_clusters[i] <- 
+    length(unique(centroids_unoise.tbl$cluster_number)) # Record the number of clusters generated for the current sample
+  
+  # ------------------------
+  # Parse clustering results
+  # ------------------------
+  
+  c.tbl <- centroids_unoise.tbl %>% 
+    rename(
+      Header = X9,
+      centroid = X10) %>%                                        # Rename positional UC columns to meaningful names
+    select(-c(
+      "length_size", "match_orientation", "X6", "X7", "X8")) %>% # Remove UC columns not required for downstream analysis
+    filter(record_type != "C") %>%                               # Remove cluster summary records
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) %>%    # Parse sequence abundance from the FASTA header
+    mutate(size = as.numeric(size)) %>% 
+    mutate(cluster_number = as.character(cluster_number)) %>% 
+    mutate(
+      centroid = ifelse(centroid == "*", Header, centroid))      # Replace the centroid placeholder with the sequence's own header for seed records
+  
+  # --------------------------------
+  # Identify non-clustered sequences
+  # --------------------------------
+  
+  n.tbl <- all.tbl %>% 
+    select(-c(actual_cluster, Sequence)) %>% 
+    filter(!(Header %in% c.tbl$Header)) # Identify input sequences not represented in the UNOISE clustering output
+  
+  metadata.tbl$n_reads_not_clustered[i] <- 
+    sum(n.tbl %>% select(size)) # Record the total number of reads represented by non-clustered sequences
+  
+  metadata.tbl$n_unique_reads_not_clustered[i] <- 
+    nrow(n.tbl) # Record the number of unique sequences not represented in the clustering output
+  
+  n.tbl <- n.tbl %>% 
+    mutate(record_type = "N",
+           cluster_number = NA_character_,
+           percent_similarity = "*",
+           centroid = NA_character_) # Format non-clustered sequences for compatibility with the clustering results table
+  
+  save(n.tbl, file = file.path(
+    noise_seqs_cluster_unoise,
+    paste0("noise_sequences_", metadata.tbl$sample_id[i], ".RData"))) # Save non-clustered sequences for downstream inspection
+  
+  # ----------------------------------
+  # Combine all clustering assignments
+  # ----------------------------------
+  
+  res.tbl <- bind_rows(c.tbl, n.tbl) %>%
+    arrange(cluster_number) %>% 
+    mutate(
+      predicted_cluster = centroid,
+      predicted_cluster = str_match(
+        predicted_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>% # Extract the taxonomic identity of the centroid as the predicted cluster identity
+    mutate(
+      actual_cluster = Header,
+      actual_cluster = str_match(
+        actual_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]+;")[,2]) %>%    # Extract the ground truth species identity of each sequence
+    left_join(all.tbl %>% select(Header, Sequence), by = "Header")    # Attach nucleotide sequences to clustering assignments
+  
+  # ---------------
+  # Purity analysis
+  # ---------------
+  
+  clustering_results.tbl <- res.tbl # Alias for readability in downstream clustering analyses
+  
+  cluster_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number) %>%
+    summarise(
+      total_reads = sum(size),
+      distinct_actual_clusters = 
+        n_distinct(actual_cluster),    # Count the number of distinct ground truth species within each predicted cluster
+      .groups = "drop"
+    ) %>%
+    mutate(status = ifelse(
+      distinct_actual_clusters == 1,
+      "Pure",
+      "Mixed")) %>%                    # Classify clusters as pure (single species) or mixed (multiple species)
+    arrange(status, desc(total_reads)) # Sort clusters by purity status and descending read count
+  
+  metadata.tbl$n_pure_clusters[i] <- 
+    sum(cluster_summary$status == "Pure") # Record the number of pure clusters for the current sample
+  
+  purity_summary <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(size_per_group = sum(size), .groups = "drop_last") %>% # Sum read counts for each species within each predicted cluster
+    arrange(desc(size_per_group)) %>%
+    summarise(
+      total_cluster_size = sum(size_per_group),       # Total number of reads assigned to the predicted cluster
+      dominant_actual = first(actual_cluster),        # Ground truth species contributing the largest number of reads
+      dominant_size = first(size_per_group),          # Number of reads contributed by the dominant species
+      purity_pct = dominant_size / total_cluster_size # Cluster purity: proportion of reads belonging to the dominant species
+    ) %>%
+    arrange(purity_pct)
+  
+  total_reads <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>% 
+    select(size) %>% 
+    sum() # Calculate the total number of reads assigned to predicted clusters
+  
+  metadata.tbl$average_purity_score[i] <- 
+    mean(purity_summary$purity_pct) # Calculate mean purity across individual predicted clusters
+  
+  # -------------------------
+  # Perfect clusters analysis
+  #--------------------------
+  
+  input_totals <- all.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(total_size_in = sum(size, na.rm = TRUE), .groups = "drop") # Calculate the total input read count for each species before clustering
+  
+  cluster_summary <- clustering_results.tbl %>%
+    group_by(cluster_number) %>%
+    summarise(
+      n_species_in_cluster = n_distinct(actual_cluster), # Count the number of distinct species within each predicted cluster
+      cluster_species = first(actual_cluster),           # Record species identity for single-species clusters
+      total_size_out = sum(size, na.rm = TRUE),          # Calculate the total number of reads represented by each cluster
+      .groups = "drop"
+    )
+  
+  species_distribution <- clustering_results.tbl %>%
+    group_by(actual_cluster) %>%
+    summarise(n_groups_for_species = n_distinct(cluster_number, na.rm = FALSE), 
+              .groups = "drop") # Count how many predicted clusters each ground truth species is distributed across
+  
+  perfect_clusters <- cluster_summary %>%
+    filter(!is.na(cluster_number)) %>%
+    filter(n_species_in_cluster == 1) %>%   # Retain only clusters containing a single species
+    left_join(
+      species_distribution, 
+      by = c("cluster_species" = "actual_cluster")
+    ) %>%
+    filter(n_groups_for_species == 1) %>%   # Retain only species represented by exactly one predicted cluster
+    left_join(
+      input_totals, 
+      by = c("cluster_species" = "actual_cluster")
+    ) %>%
+    filter(total_size_out == total_size_in) # Retain clusters containing all reads belonging to the corresponding species
+  
+  metadata.tbl$n_perfect_clusters[i] <- 
+    nrow(perfect_clusters) # Record the number of perfect clusters: pure, non-split, and complete
+  
+  
+  # ------------------------------------------
+  # Represented species and abundance profiles
+  #-------------------------------------------
+  
+  dominant_species_per_cluster <- clustering_results.tbl %>%
+    filter(!is.na(cluster_number)) %>%
+    group_by(cluster_number, actual_cluster) %>%
+    summarise(total_size = sum(size), .groups = "drop_last") %>%
+    arrange(cluster_number, desc(total_size)) %>%
+    summarise(dominant_actual_cluster = first(actual_cluster), .groups = "drop") # Assign each predicted cluster to the species contributing the largest number of reads
+  
+  save(dominant_species_per_cluster,
+       file = file.path(
+         dominant_species_folder_cluster_unoise,
+         paste0("dominant_species_per_cluster_", 
+                metadata.tbl$sample_id[i], ".RData"))) # Save dominant-species assignments for downstream abundance analysis
+  
+  metadata.tbl$n_species_represented[i] <- 
+    length(unique(dominant_species_per_cluster$dominant_actual_cluster)) # Record the number of species represented by at least one predicted cluster
+  
+  n_species_with_multiple_clusters <- dominant_species_per_cluster %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(
+      n_clusters = n(), 
+      .groups = "drop"
+    ) %>%
+    filter(n_clusters >= 2) %>%
+    nrow() # Count species that dominate multiple predicted clusters (over-splitting)
+  
+  metadata.tbl$n_species_with_multiple_clusters[i] <- 
+    n_species_with_multiple_clusters # Record the number of over-split species
+  
+  # ------------------
+  # Abundance analysis
+  # ------------------
+  
+  fq <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) %>%
+    mutate(
+      actual_cluster = Header,
+      actual_cluster = str_match(
+        actual_cluster, "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) # Read raw R1 reads and extract the ground truth species identity
+  
+  abundance_per_initiate_species <- fq %>%
+    group_by(actual_cluster) %>%
+    summarise(gold_standard_n = n(), .groups = "drop") %>%
+    mutate(gold_standard_rel_abundance = gold_standard_n / sum(gold_standard_n)) %>%
+    arrange(desc(gold_standard_rel_abundance)) # Calculate ground truth relative abundance directly from raw read counts
+  
+  abundance_per_species <- clustering_results.tbl %>%
+    left_join(dominant_species_per_cluster, by = "cluster_number") %>% 
+    mutate(
+      dominant_actual_cluster = replace_na(
+        dominant_actual_cluster, "Unassigned")) %>%
+    group_by(dominant_actual_cluster) %>%
+    summarise(n = sum(size), .groups = "drop") %>%
+    mutate(rel_abundance = n / sum(n)) %>%
+    arrange(desc(rel_abundance)) %>%
+    rename(actual_cluster = dominant_actual_cluster) # Calculate observed species relative abundance from the clustering results
+  
+  abundance.tbl <- abundance_per_initiate_species %>%
+    left_join(abundance_per_species, by = "actual_cluster") %>%
+    mutate(n = replace_na(n, 0),
+           rel_abundance = replace_na(rel_abundance, 0)) # Combine ground truth and observed abundance profiles and assign zero to missing species
+  
+  save(abundance.tbl,
+       file = file.path(
+         dominant_species_folder_cluster_unoise,
+         paste0("abundance_", metadata.tbl$sample_id[i], ".RData"))) # Save abundance profiles for downstream comparisons
+  
+  metadata.tbl$abundance_correlation[i] <- cor(
+    abundance.tbl$gold_standard_rel_abundance, 
+    abundance.tbl$rel_abundance) # Calculate Pearson correlation between ground truth and observed relative abundances
+}
+
+save(
+  metadata.tbl, 
+  file = file.path(cluster_unoise_folder, "metadata.tbl.RData")) # Save metadata with all UNOISE clustering performance statistics
+```
+
+## Plotting Preparations After Processing All Datasets
+
+```{r}
+# IMPORTANT:
+# Run this section only after all datasets have been fully processed with the
+# UNOISE pipeline using minsize = 8. The code below loads the final metadata
+# table from each dataset and combines them into a single table for downstream
+# plotting and comparative analyses.
+
+# --------------------------------
+# Load per-dataset metadata tables
+# --------------------------------
+
+load("100_species_10_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_100s_10d.tbl <- metadata.tbl            
+
+load("100_species_100_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_100s_100d.tbl <- metadata.tbl                                          
+
+load("1000_species_10_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_1000s_10d.tbl <- metadata.tbl                                        
+
+load("1000_species_100_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_1000s_100d.tbl <- metadata.tbl                                       
+
+load("10000_species_10_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_10000s_10d.tbl <- metadata.tbl                                       
+
+load("10000_species_100_dynamic/rsearch_results/cluster_unoise_8/metadata.tbl.RData")
+metadata_10000s_100d.tbl <- metadata.tbl                                     
+
+# --------------------------------
+# Load per-dataset metadata tables
+# --------------------------------
+
+load("100_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_100s_10d.tbl <- metadata.tbl
+
+load("100_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_100s_100d.tbl <- metadata.tbl
+
+load("1000_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_1000s_10d.tbl <- metadata.tbl
+
+load("1000_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_1000s_100d.tbl <- metadata.tbl                                        
+
+load("10000_species_10_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_10000s_10d.tbl <- metadata.tbl                                     
+
+load("10000_species_100_dynamic/rsearch_results/cluster_size/metadata.tbl.RData")
+metadata_10000s_100d.tbl <- metadata.tbl                                        
+
+# --------------------------------------------
+# Combine datasets by simulated species richness
+# --------------------------------------------
+
+metadata_100s <- bind_rows(
+  metadata_100s_10d.tbl,
+  metadata_100s_100d.tbl) # Combine all 100-species datasets across dynamic ranges
+
+metadata_1000s <- bind_rows(
+  metadata_1000s_10d.tbl,
+  metadata_1000s_100d.tbl) # Combine all 1000-species datasets across dynamic ranges
+
+metadata_10000s <- bind_rows(
+  metadata_10000s_10d.tbl,
+  metadata_10000s_100d.tbl) # Combine all 10000-species datasets across dynamic ranges
+
+# --------------------------------
+# Combine all processed datasets
+# --------------------------------
+
+metadata_cluster_unoise_8_all.tbl <- bind_rows(
+  metadata_100s,
+  metadata_1000s,
+  metadata_10000s) %>%
+  mutate(pipeline = "cluster_unoise_8") # Add a pipeline identifier for downstream comparisons across clustering methods
+
+save(
+  metadata_cluster_unoise_8_all.tbl,
+  file = "metadata_all_cluster_unoise_8_tbl.RData") # Save the combined metadata table for downstream plotting and comparative analyses
+
