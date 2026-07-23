@@ -24,8 +24,6 @@ knitr::opts_chunk$set(eval = FALSE)
 # Required Packages
 
 ```{r, message=FALSE, warning=FALSE}
-library(forcats)
-library(mclust)
 library(microseq)
 library(Rsearch)
 library(tidyverse)
