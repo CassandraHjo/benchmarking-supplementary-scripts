@@ -1,0 +1,560 @@
+---
+title: "Processing and Denoising of Simulated Data Using DADA2"
+date: "2026-07-23"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Required Packages
+
+```{r, message=FALSE, warning=FALSE}
+library(dada2)
+library(microseq)
+library(tidyverse)
+```
+
+## Global Settings
+
+```{r}
+setwd("/path/to/working/directory") # Path to your working directory
+```
+
+## Prepare directories
+
+```{r}
+path                          <- "1000_species_10_dynamic"         # Define dataset to process
+fastq.folder                  <- file.path(path, "fastq")          # Directory containing the raw FASTQ files
+fastq_filt.folder             <- file.path(path, "fastq_filtered") # Directory containing quality-filtered FASTQ files
+dada2_dir                     <- file.path(path, "dada2_results")  # Directory containing DADA2 output
+metadata.file                 <- file.path(path, "metadata.tsv")   # Path to the metadata file
+dominant_species_folder_dada2 <- 
+  file.path(dada2_dir, "dominant_species")                         # Directory containing dominant-species assignments for each cluster
+abundance_folder_dada2        <- 
+  file.path(dada2_dir, "abundance_tables")             # Directory containing observed and ground truth abundance tables
+error_obj.folder              <- 
+  file.path(dada2_dir, "error_objects")                # Directory containing DADA2 error objects
+centroids.folder              <- 
+  file.path(dada2_dir, "centroids")                    # Directory containing centroid FASTA files
+
+# ----------------------------
+# Create required directories
+# ----------------------------
+
+if (!dir.exists(dada2_dir)) {
+  dir.create(dada2_dir)
+}
+
+if (!dir.exists(dominant_species_folder_dada2)) {
+  dir.create(dominant_species_folder_dada2)
+}
+
+if (!dir.exists(abundance_folder_dada2)) {
+  dir.create(abundance_folder_dada2)
+}
+
+if (!dir.exists(error_obj.folder)) {
+  dir.create(error_obj.folder)
+}
+
+if (!dir.exists(centroids.folder)) {
+  dir.create(centroids.folder)
+}
+```
+
+## Metadata
+
+```{r}
+# Read metadata file and add columns for results
+metadata.tbl <- read_tsv(metadata.file) %>% 
+  select(-c(community_id, amplicon_file)) %>%
+  rename(n_reads = readpairs) %>% 
+  mutate(dataset = path) %>%
+  mutate(n_reads_filtered = 0) %>% 
+  mutate(n_reads_merged = 0) %>% 
+  mutate(n_reads_wo_chimera = 0) %>% 
+  mutate(n_clusters = 0) %>% 
+  mutate(n_pure_clusters = 0) %>%
+  mutate(n_perfect_clusters = 0) %>%
+  mutate(average_purity_score = 0) %>%
+  mutate(n_species = 0) %>% 
+  mutate(n_species_filtered = 0) %>% 
+  mutate(n_species_merged = 0) %>% 
+  mutate(n_species_wo_chimera = 0) %>% 
+  mutate(n_species_represented = 0) %>% 
+  mutate(n_species_with_multiple_clusters = 0) %>% 
+  mutate(abundance_correlation = 0)
+```
+
+# Collect Metadata
+
+## Raw Reads
+
+```{r}
+R1_files <- file.path(fastq.folder, paste0(metadata.tbl$sample_id, "_R1.fastq.gz"))
+
+for(i in 1:length(R1_files)){
+  fq1 <- readFastq(R1_files[i]) %>% 
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)"))
+  
+  metadata.tbl$n_species[i] <- n_distinct(fq1$species)
+} # Record the number of species present before read processing in the raw files in each sample
+
+save(metadata.tbl, file = file.path(dada2_dir, "metadata.tbl.RData")) # Save metadata
+```
+
+## Filtered Reads
+
+```{r}
+filt_R1_files <- file.path(fastq_filt.folder, paste0(metadata.tbl$sample_id, "_R1_filtered.fastq"))
+filt_R2_files <- file.path(fastq_filt.folder, paste0(metadata.tbl$sample_id, "_R2_filtered.fastq"))
+
+for(i in 1:length(filt_R1_files)){
+  fq1 <- readFastq(filt_R1_files[i])
+  metadata.tbl$n_reads_filtered[i] <- nrow(fq1)
+  
+  fq1 <- fq1 %>% 
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)"))
+  metadata.tbl$n_species_filtered[i] <- n_distinct(fq1$species)
+} # Record the number of species represented after quality filtering
+
+save(metadata.tbl, file = file.path(dada2_dir, "metadata.tbl.RData")) # Save metadata
+```
+
+# DADA2 Denoising Pipeline with Read-Level Tracking
+
+```{r}
+for (i in 1:nrow(metadata.tbl)) { # Iterate over each sample in the metadata table
+  
+  message(paste0("Processing sample ", 
+                 metadata.tbl$sample_id[i], 
+                 " (", i, "/", nrow(metadata.tbl), ")"))
+  
+  # ------------------
+  # Learn error models
+  # ------------------
+  
+  err.obj_R1 <- 
+    learnErrors(fls = filt_R1_files[i],
+                multithread = TRUE,
+                verbose= TRUE) # Learn the sample-specific error model for forward (R1) reads
+  
+  save(err.obj_R1, file = file.path(error_obj.folder,
+                                    paste0(str_remove(basename(filt_R1_files[i]),
+                                                      "R1_filtered.fastq"),
+                                           "err.obj_R1.RData"))) # Save the forward-read error model for later reuse
+  
+  err.obj_R2 <- 
+    learnErrors(fls = filt_R2_files[i],
+                multithread = TRUE,
+                verbose= TRUE) # Learn the sample-specific error model for reverse (R2) reads
+  
+  save(err.obj_R2, file = file.path(error_obj.folder,
+                                    paste0(str_remove(basename(filt_R2_files[i]),
+                                                      "R2_filtered.fastq"),
+                                           "err.obj_R2.RData"))) # Save the reverse-read error model for later reuse
+  
+  # ---------------------------
+  # Dereplication and denoising
+  # ---------------------------
+  
+  derepF <- 
+    derepFastq(
+      filt_R1_files[i], verbose = FALSE) # Dereplicate filtered forward reads while retaining the mapping from reads to unique sequences
+  
+  derepR <- 
+    derepFastq(
+      filt_R2_files[i], verbose = FALSE) # Dereplicate filtered reverse reads while retaining the mapping from reads to unique sequences
+  
+  dadaF <- dada(
+    derepF, err = err.obj_R1, multithread = TRUE, verbose = FALSE) # Denoise forward reads using the learned R1 error model
+  
+  dadaR <- dada(
+    derepR, err = err.obj_R2, multithread = TRUE, verbose = FALSE) # Denoise reverse reads using the learned R2 error model
+  
+  # ---------------------------
+  # Merge paired-end sequences
+  # ---------------------------
+  
+  merged.obj <- mergePairs(dadaF, derepF, dadaR, derepR, verbose = FALSE) # Merge denoised forward and reverse sequences
+  
+  # ----------------
+  # Remove chimeras
+  # ----------------
+  
+  merged_wo_chimera.obj <- removeBimeraDenovo(
+    merged.obj,
+    method = "consensus",
+    multithread = TRUE,
+    verbose = FALSE) # Identify and remove chimeric merged sequences
+  
+  # ---------------------
+  # Create sequence table
+  # ---------------------
+  
+  seqtab.local <- makeSequenceTable(merged_wo_chimera.obj) # Create an ASV abundance table from the chimera-free merged sequences
+  
+  local_valid_sequences <- colnames(seqtab.local) # Extract nucleotide sequences corresponding to retained ASVs
+  
+  # --------------------------
+  # Prepare read-level tracking
+  # --------------------------
+  
+  headers_R1 <- readFastq(filt_R1_files[i])$Header # Retrieve original read headers from the filtered forward FASTQ file
+  
+  df <- as.data.frame(headers_R1) %>%
+    rename(Header = headers_R1) %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Extract the ground truth species identity from each read header
+  
+  metadata.tbl$n_species[i] <- length(unique(df$species)) # Record the number of ground truth species represented in the filtered reads
+  
+  # -----------------------------------------
+  # Map original reads to denoised sequences
+  # -----------------------------------------
+  
+  read_to_denoised_F_index <- dadaF$map[derepF$map] # Map each original forward read to its corresponding denoised sequence
+  
+  read_to_denoised_R_index <- dadaR$map[derepR$map] # Map each original reverse read to its corresponding denoised sequence
+  
+  # --------------------------------
+  # Map denoised reads to merged ASVs
+  # --------------------------------
+  
+  read_pair_key <- paste(read_to_denoised_F_index, read_to_denoised_R_index, sep = "_") # Create a forward-reverse denoised-sequence key for each original read pair
+  
+  merged_key <- paste(merged.obj$forward, merged.obj$reverse, sep = "_") # Create the corresponding forward-reverse key for merged sequences
+  
+  match_idx <- match(read_pair_key, merged_key) # Identify the merged sequence associated with each original read pair
+  
+  assigned_sequences <- merged.obj$sequence[match_idx] # Retrieve the merged nucleotide sequence for each read pair; NA indicates failed merging
+  
+  # -------------------------------
+  # Construct read-tracking table
+  # -------------------------------
+  
+  dataset_tracking <- tibble(
+    Dataset_ID = metadata.tbl$sample_id[i],
+    Header = headers_R1,
+    Merged_Sequence = assigned_sequences
+  ) %>%
+    mutate(ASV_Index =
+             match(Merged_Sequence,
+                   local_valid_sequences)) %>%      # Check if merged sequence is chimera-free
+    mutate(ASV_ID =
+             ifelse(is.na(ASV_Index),
+                    NA,
+                    paste0("OTU_", ASV_Index))) %>% # Assign cluster ID (If match is NA (chimera or merge fail), ID is NA)
+    mutate(Status = case_when(                      # Add status flag
+      is.na(Merged_Sequence) ~ "Merge_Failed",
+      is.na(ASV_ID) ~ "Chimera",
+      TRUE ~ "Valid_ASV"
+    ))
+  
+  # ---------------------------
+  # Collect DADA2 statistics
+  # ---------------------------
+  
+  metadata.tbl$n_reads_merged[i] <- 
+    sum(merged.obj$abundance) # Record the number of read pairs successfully merged
+  
+  metadata.tbl$n_reads_wo_chimera[i] <- 
+    sum(merged_wo_chimera.obj$abundance) # Record the number of reads retained after chimera removal
+  
+  metadata.tbl$n_clusters[i] <- 
+    ncol(seqtab.local) # Record the number of ASVs retained after chimera removal
+  
+  
+  # ----------------------------
+  # Write representative sequences
+  # ----------------------------
+  
+  readcount.mat <- makeSequenceTable(merged_wo_chimera.obj)
+  
+  centroids.tbl <- tibble(Header = str_c("OTU", 1:ncol(readcount.mat)),
+                          Sequence = colnames(readcount.mat)) # Create a FASTA-compatible table containing representative ASV sequences
+  
+  writeFasta(
+    centroids.tbl, out.file = file.path(
+      centroids.folder,
+      paste0(str_remove(basename(filt_R1_files[i]),
+                        "R1_filtered.fastq"),
+             "centroids.fasta"))) # Write representative ASV sequences to FASTA for downstream analyses
+  
+  # ---------------
+  # Purity analysis
+  # ---------------
+  
+  dataset_tracking_proc <- dataset_tracking %>%
+    mutate(predicted_cluster = ASV_ID) %>%
+    mutate(actual_cluster = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Add predicted ASV assignments and ground truth species identities to each read
+  
+  metadata.tbl$n_species_merged[i] <-
+    dataset_tracking_proc %>%
+    filter(!is.na(Merged_Sequence)) %>%
+    pull(actual_cluster) %>%
+    n_distinct() # Record the number of species represented among successfully merged reads
+  
+  metadata.tbl$n_species_wo_chimera[i] <-
+    dataset_tracking_proc %>%
+    filter(Status == "Valid_ASV") %>%
+    pull(actual_cluster) %>%
+    n_distinct() # Record the number of species represented after chimera removal
+  
+  
+  cluster_summary <-
+    dataset_tracking_proc %>%
+    group_by(predicted_cluster) %>%
+    summarise(
+      n_sequences = n(),               # Count the number of reads assigned to each predicted ASV
+      distinct_actual_clusters = 
+        n_distinct(actual_cluster),    # Count the number of distinct ground truth species represented within each ASV
+      .groups = "drop"
+    ) %>%
+    mutate(                            # Add new column indicating if cluster is pure or mixed
+      status = ifelse(
+        distinct_actual_clusters == 1,
+        "Pure",
+        "Mixed")) %>%                  # Classify ASVs as pure (single species) or mixed (multiple species)
+    arrange(status, desc(n_sequences)) # Sort by purity status and descending read count
+  
+  metadata.tbl$n_pure_clusters[i] <- 
+    sum(cluster_summary$status == "Pure") # Record the number of pure predicted ASVs
+  
+  purity_summary <- dataset_tracking_proc %>%
+    group_by(predicted_cluster) %>%
+    dplyr::count(actual_cluster,
+                 sort = TRUE,
+                 name = "number"    
+    ) %>%                                         # Count reads from each ground truth species within each predicted ASV
+    summarise(
+      total_number = sum(number),                 # Total number of reads assigned to the predicted ASV
+      dominant_actual = first(actual_cluster),    # Ground truth species contributing the largest number of reads
+      dominant_number = first(number),            # Number of reads contributed by the dominant species
+      purity_pct = dominant_number / total_number # ASV purity: proportion of reads belonging to the dominant species
+    ) %>%
+    arrange(purity_pct)
+  
+  metadata.tbl$average_purity_score[i] <- 
+    mean(purity_summary$purity_pct) # Calculate mean purity across predicted ASVs
+  
+  # -------------------------
+  # Perfect clusters analysis
+  #--------------------------
+  
+  dt <- dataset_tracking_proc # Alias for readability in the perfect-cluster analysis
+  
+  pure_asvs <- dt %>%
+    filter(Status == "Valid_ASV", !is.na(predicted_cluster)) %>%
+    group_by(predicted_cluster) %>%
+    summarise(n_species = n_distinct(actual_cluster), .groups = "drop") %>%
+    filter(n_species == 1) %>%
+    select(predicted_cluster) # Identify ASVs containing reads from exactly one ground truth species
+  
+  dt_pure_valid <- dt %>%
+    filter(Status == "Valid_ASV", !is.na(predicted_cluster)) %>%
+    semi_join(pure_asvs, by = "predicted_cluster") # Retain reads belonging to pure ASVs
+  
+  species_ok <- dt_pure_valid %>%
+    distinct(actual_cluster, predicted_cluster) %>%
+    group_by(actual_cluster) %>%
+    summarise(n_asv = n(), .groups = "drop") %>%
+    filter(n_asv == 1) %>%
+    select(actual_cluster) # Retain species represented by exactly one pure ASV
+  
+  species_to_asv <- dt_pure_valid %>%
+    semi_join(species_ok, by = "actual_cluster") %>%
+    distinct(actual_cluster, predicted_cluster) # Establish the expected one-to-one mapping between species and ASVs
+  
+  violations <- dt %>%
+    semi_join(species_ok, by = "actual_cluster") %>%
+    left_join(
+      species_to_asv, by = "actual_cluster", suffix = c("", "_expected")) %>%
+    mutate(
+      ok = (Status == "Valid_ASV") & (predicted_cluster == predicted_cluster_expected)) %>%
+    filter(!ok) %>%
+    select(actual_cluster, predicted_cluster_expected, 
+           Header, Status, predicted_cluster) # Identify reads from candidate species that were lost or assigned outside the expected ASV
+  
+  missing_counts <- violations %>%
+    group_by(predicted_cluster_expected) %>%
+    summarise(n_missing = n(), .groups = "drop") # Count missing or incorrectly assigned reads for each candidate perfect ASV
+  
+  perfect_clusters_dada2 <- species_to_asv %>%
+    left_join(missing_counts, by = c("predicted_cluster" = "predicted_cluster_expected")) %>%
+    mutate(n_missing = coalesce(n_missing, 0L)) %>%
+    filter(n_missing == 0) # Retain ASVs that are pure, non-split, and contain all reads from the corresponding species
+  
+  metadata.tbl$n_perfect_clusters[i] <- nrow(perfect_clusters_dada2) # Record the number of perfect ASVs
+  
+  # ------------------------------------------
+  # Represented species and abundance profiles
+  #-------------------------------------------
+  
+  df <- dataset_tracking_proc %>%
+    filter(Status == "Valid_ASV") # Retain only reads assigned to valid ASVs
+  
+  dominant_species_per_cluster <- df %>%
+    group_by(predicted_cluster) %>%
+    summarise(
+      species = {
+        tab <- sort(table(actual_cluster), decreasing = TRUE)
+        names(tab)[1]
+      },
+      .groups = "drop") # Assign each ASV to the ground truth species contributing the largest number of reads
+  
+  saveRDS(dominant_species_per_cluster,
+          file = file.path(
+            dominant_species_folder_dada2,
+            paste0("dominant_species_per_cluster_", metadata.tbl$sample_id[i], ".rds"))) # Save dominant-species assignments for downstream analyses
+  
+  metadata.tbl$n_species_represented[i] <- 
+    length(unique(dominant_species_per_cluster$species)) # Record the number of species represented by at least one ASV
+  
+  n_species_with_multiple_clusters <- dominant_species_per_cluster %>%
+    group_by(species) %>%
+    summarise(n_clusters = n(), .groups = "drop") %>%
+    filter(n_clusters >= 2) %>%
+    nrow() # Count species represented by multiple ASVs (over-splitting)
+  
+  metadata.tbl$n_species_with_multiple_clusters[i] <- 
+    n_species_with_multiple_clusters # Record the number of over-split species
+  
+  # ------------------
+  # Abundance analysis
+  # ------------------
+  
+  fq <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i])) %>%
+    mutate(species = Header %>% 
+             str_extract("(?<=s:).+?(?=_\\d+_\\d+/)")) # Read raw R1 reads and extract the ground truth species identity
+  
+  abundance_per_initiate_species <- fq %>%
+    group_by(species) %>%
+    summarise(gold_standard_n = n(), .groups = "drop") %>%
+    mutate(gold_standard_rel_abundance = gold_standard_n / sum(gold_standard_n)) %>%
+    arrange(desc(gold_standard_rel_abundance)) # Calculate ground truth relative abundance directly from raw read counts
+  
+  abundance_per_dominant_species <- df %>%
+    left_join(dominant_species_per_cluster, by = "predicted_cluster") %>%
+    group_by(species) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(rel_abundance = n / sum(n)) %>%
+    arrange(desc(rel_abundance)) # Calculate observed species abundance after assigning each ASV to its dominant species
+  
+  abundance.tbl <- abundance_per_initiate_species %>%
+    left_join(abundance_per_dominant_species, by = "species") %>%
+    mutate(n = replace_na(n, 0),
+           rel_abundance = replace_na(rel_abundance, 0)) # Combine ground truth and observed abundance profiles and assign zero to missing species
+  
+  saveRDS(abundance.tbl,
+          file = file.path(
+            abundance_folder_dada2,
+            paste0("abundance_", metadata.tbl$sample_id[i], ".rds"))) # Save abundance profiles for downstream comparisons
+  
+  metadata.tbl$abundance_correlation[i] <- cor(
+    abundance.tbl$gold_standard_rel_abundance,
+    abundance.tbl$rel_abundance) # Calculate Pearson correlation between ground truth and observed relative abundances
+  
+  # ---------------------------------
+  # Non-clustered sequence statistics
+  # ---------------------------------
+  
+  nc.tbl <- dataset_tracking %>% 
+    filter(Status != "Valid_ASV") %>%                                   # Retain reads removed because of failed merging or chimera detection
+    select(Dataset_ID, Header, Status) %>% 
+    mutate(taxonomy = 
+             str_match(Header, "tax=(.*)_[0-9]+_[0-9]+/[0-9]")[,2]) %>% # Extract the ground truth taxonomic label from each non-clustered read
+    mutate(species = str_extract(taxonomy, "(?<=s:).*")) %>%            # Extract the species name from the taxonomic annotation
+    left_join(abundance_per_initiate_species, by = "species")           # Attach ground truth abundance information
+  
+ metadata.tbl$n_reads_not_clustered[i] <- 
+    nrow(nc.tbl) # Record the number of reads not represented by a valid ASV
+  
+  metadata.tbl$n_species_not_clustered[i] <- 
+    n_distinct(nc.tbl$taxonomy) # Record the number of species represented among non-clustered reads
+  
+  metadata.tbl$median_ground_truth_abuandance[i] <- 
+    median(nc.tbl$gold_standard_rel_abundance) # Record the median ground truth abundance of species contributing non-clustered reads
+}
+
+save(metadata.tbl, file = file.path(dada2_dir, "metadata.tbl.RData")) # Save metadata
+```
+# Plotting Preparations After Processing All Datasets
+
+```{r}
+# IMPORTANT:
+# Run this section only after all datasets have been fully processed with the
+# DADA2 pipeline. The code below loads the final metadata table from each
+# dataset and combines them into a single table for downstream plotting and
+# comparative analyses.
+
+# --------------------------------
+# Load per-dataset metadata tables
+# --------------------------------
+
+load("100_species_10_dynamic/dada2_results/metadata.tbl.RData")
+metadata_100s_10d.tbl <- metadata.tbl                                        
+
+load("100_species_100_dynamic/dada2_results/metadata.tbl.RData")
+metadata_100s_100d.tbl <- metadata.tbl                                        
+
+load("1000_species_10_dynamic/dada2_results/metadata.tbl.RData")
+metadata_1000s_10d.tbl <- metadata.tbl                                       
+
+load("1000_species_100_dynamic/dada2_results/metadata.tbl.RData")
+metadata_1000s_100d.tbl <- metadata.tbl                                    
+
+load("10000_species_10_dynamic/dada2_results/metadata.tbl.RData")
+metadata_10000s_10d.tbl <- metadata.tbl                                        
+
+load("10000_species_100_dynamic/dada2_results/metadata.tbl.RData")
+metadata_10000s_100d.tbl <- metadata.tbl                                      
+
+# --------------------------------------------
+# Combine datasets by simulated species richness
+# --------------------------------------------
+
+metadata_100s <- bind_rows(
+  metadata_100s_10d.tbl,
+  metadata_100s_100d.tbl) # Combine all 100-species datasets across dynamic ranges
+
+metadata_1000s <- bind_rows(
+  metadata_1000s_10d.tbl,
+  metadata_1000s_100d.tbl) # Combine all 1000-species datasets across dynamic ranges
+
+metadata_10000s <- bind_rows(
+  metadata_10000s_10d.tbl,
+  metadata_10000s_100d.tbl) # Combine all 10000-species datasets across dynamic ranges
+
+# --------------------------------
+# Combine all processed datasets
+# --------------------------------
+
+metadata_all_dada2.tbl <- bind_rows(
+  metadata_100s,
+  metadata_1000s,
+  metadata_10000s
+) %>%
+  mutate(pipeline = "dada2") # Add a pipeline identifier for downstream comparisons across methods
+
+save(
+  metadata_all_dada2.tbl,
+  file = "metadata_all_dada2_tbl.RData") # Save the combined metadata table for downstream plotting and comparative analyses
+```
