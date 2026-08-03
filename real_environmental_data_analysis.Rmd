@@ -64,7 +64,9 @@ metadata.tbl <- read_tsv(metadata.file) %>%
   mutate(n_reads_merged = 0) %>%            # Placeholder column for read count after paired-end merging
   mutate(n_reads_dereplicated = 0) %>%      # Placeholder column for read count after dereplication
   mutate(n_reads_wo_chimera = 0) %>%        # Placeholder column for read count after chimera removal
-  filter(Location %in% c(1, 2))             # Retain only samples from locations 1 and 2 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  filter(Location %in% c(1, 2, 3))          # Filter metadata to contain data from 3 locations
+
+metadata.tbl <- metadata.tbl[1:60, ]        # Extract data for 10 sampling locations
 ```
 
 # Plot Base Quality
