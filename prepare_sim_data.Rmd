@@ -1,5 +1,5 @@
 ---
-title: "Prepare data for simulations"
+title: "Prepare Data for Simulations"
 output: html_document
 date: "2026-06-24"
 author: Cassandra Stamsaas & Lars Snipen
