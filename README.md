@@ -23,7 +23,7 @@ This repository contains the scripts used for the analyses presented in **"Metab
 | Name      | Type      | Version   | Link      |
 |-----------|-----------|-----------|-----------|
 | R          | Software  | 4.5.1     | https://docs.posit.co/ide/user/ |
-| Rsearch    | R package | 1.1.0     | https://CRAN.R-project.org/package=Rsearch |
+| Rsearch    | R package | 1.2.0     | https://CRAN.R-project.org/package=Rsearch |
 | tidyverse  | R package | 2.0.0     | https://CRAN.R-project.org/package=tidyverse |
 | microseq   | R package | 2.1.7     | https://CRAN.R-project.org/package=microseq |
 | dada2      | R package | 1.36      | https://bioconductor.posit.co/packages/3.23/bioc/html/dada2.html |
